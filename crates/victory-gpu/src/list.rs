@@ -141,6 +141,14 @@ fn with_state(this: This, f: impl FnOnce(&crate::host::HostList, &mut crate::dra
     f(list, &mut state.lock().unwrap_or_else(|e| e.into_inner()));
 }
 
+/// After host work that bound its own pipeline, roots and heaps on the list
+/// (the PC upscaler, `crate::ffx`): the next draw or dispatch binds the
+/// title's again.
+#[cfg(windows)]
+pub(crate) fn forget_host_bindings(this: This) {
+    with_state(this, |_, state| state.forget_host());
+}
+
 /// The host list behind a title list, if there is a host GPU.
 #[cfg(windows)]
 pub(crate) fn host_list<'a>(this: This) -> Option<&'a crate::host::HostList> {

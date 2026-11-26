@@ -248,10 +248,13 @@ fn queue(p: Arc<Pending>) {
     let sender = SENDER[usize::from(screen)].get_or_init(|| {
         let (sender, receiver) = std::sync::mpsc::channel::<Arc<Pending>>();
         let _ = RECEIVER[usize::from(screen)].set(Mutex::new(receiver));
-        let workers = if screen {
-            2
-        } else {
-            std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8))
+        // `VICTORY_PIPELINE_WORKERS=<n>`: that many for each kind (1: one
+        // compile at a time, to name a pipeline a driver removes the device on).
+        let asked = std::env::var("VICTORY_PIPELINE_WORKERS").ok().and_then(|v| v.trim().parse::<usize>().ok());
+        let workers = match asked {
+            Some(n) => n.clamp(1, 16),
+            None if screen => 2,
+            None => std::thread::available_parallelism().map_or(2, |n| (n.get() / 2).clamp(2, 8)),
         };
         for i in 0..workers {
             worker(i + if screen { 50 } else { 0 }, screen);

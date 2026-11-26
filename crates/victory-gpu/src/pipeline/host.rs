@@ -394,10 +394,63 @@ fn refuse(reason: &'static str, shaders: &[Arc<Shader>]) -> Option<HostPipeline>
     None
 }
 
+/// Pipelines being made right now, by their shaders: a device removed while
+/// one was made (a driver's compiler that removes the device instead of
+/// failing the call) names them ([`making`]).
+static MAKING: std::sync::Mutex<Vec<(usize, String)>> = std::sync::Mutex::new(Vec::new());
+
+/// The pipelines being made, as their shader lists.
+pub(crate) fn making() -> Vec<String> {
+    MAKING.lock().unwrap_or_else(|e| e.into_inner()).iter().map(|(_, s)| s.clone()).collect()
+}
+
+/// A shader of `shaders` that no pipeline is made with: listed in
+/// `VICTORY_REFUSE_SHADERS` (16-digit hashes, comma-separated), for a driver
+/// whose compiler removes the device on it rather than failing the call.
+fn refused_shader(shaders: &[Arc<Shader>]) -> Option<String> {
+    static LIST: std::sync::OnceLock<Vec<String>> = std::sync::OnceLock::new();
+    let list = LIST.get_or_init(|| {
+        std::env::var("VICTORY_REFUSE_SHADERS")
+            .unwrap_or_default()
+            .split(',')
+            .map(|h| h.trim().to_ascii_lowercase())
+            .filter(|h| !h.is_empty())
+            .collect()
+    });
+    shaders.iter().find(|s| list.iter().any(|h| *h == s.hash.to_string())).map(|s| s.hash.to_string())
+}
+
+/// While held, its pipeline is in [`MAKING`].
+struct Making(usize);
+
+impl Making {
+    fn new(shaders: &[Arc<Shader>]) -> Making {
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let id = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let text = shaders.iter().map(|s| format!("{} {}", s.stage, s.hash)).collect::<Vec<_>>().join(", ");
+        MAKING.lock().unwrap_or_else(|e| e.into_inner()).push((id, text));
+        Making(id)
+    }
+}
+
+impl Drop for Making {
+    fn drop(&mut self) {
+        MAKING.lock().unwrap_or_else(|e| e.into_inner()).retain(|(id, _)| *id != self.0);
+    }
+}
+
 impl HostPipeline {
     /// A host pipeline for vertex and pixel shaders with the graphics
     /// state `g`, or for one compute shader.
     pub(crate) fn new(shaders: &[Arc<Shader>], g: Option<&GraphicsState>) -> Option<HostPipeline> {
+        if let Some(hash) = refused_shader(shaders) {
+            static SAID: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            if SAID.fetch_add(1, std::sync::atomic::Ordering::Relaxed) < 20 {
+                tracing::warn!(hash, "pipeline not made: one of its shaders is refused (VICTORY_REFUSE_SHADERS)");
+            }
+            return None;
+        }
+        let _making = Making::new(shaders);
         let find = |stage| shaders.iter().find(|s| s.stage == stage);
         let compute = match shaders {
             [cs] if cs.stage == "compute" => Some(cs),

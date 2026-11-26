@@ -218,6 +218,36 @@ const ALLOC_32BIT: u64 = 1 << 33;
 /// Our block header: the block's size and alignment, just below the
 /// pointer handed out.
 const HEADER: usize = 2 * size_of::<usize>();
+/// The memory type in `XMemAlloc` attributes (after the alignment).
+const MEMORY_TYPE_SHIFT: u64 = 29;
+/// In a block header's alignment word: the block is a reservation of its own
+/// below 2^40 ([`low_alloc`]), freed with `VirtualFree`.
+const LOW: usize = 1 << 62;
+
+/// `size` bytes reserved and committed below 2^40, where the console's GPU
+/// addresses lie; null if none is free there. Placed from 64 GiB upwards,
+/// each try past the last block given.
+fn low_alloc(size: usize) -> *mut u8 {
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    const FLOOR: usize = 64 << 30;
+    const CEILING: usize = 1 << 40;
+    static NEXT: AtomicUsize = AtomicUsize::new(FLOOR);
+    let step = size.next_multiple_of(64 << 10);
+    let mut at = NEXT.load(Ordering::Relaxed);
+    for _ in 0..4096 {
+        if at + step > CEILING {
+            at = FLOOR;
+        }
+        // SAFETY: a request for fresh pages at a hint; it fails if taken.
+        let block = unsafe { VirtualAlloc(at as *mut c_void, step, MEM_RESERVE | MEM_COMMIT, PAGE_READWRITE) };
+        if !block.is_null() {
+            NEXT.store(block as usize + step, Ordering::Relaxed);
+            return block.cast();
+        }
+        at += step.max(16 << 20);
+    }
+    std::ptr::null_mut()
+}
 
 fn layout(size: usize, attributes: u64) -> Option<Layout> {
     // An alignment of at least 16 leaves room for the header.
@@ -297,10 +327,24 @@ pub extern "system" fn XMemAllocDefault(size: usize, attributes: u64) -> *mut c_
     let Some(layout) = layout(size, attributes) else {
         return std::ptr::null_mut();
     };
-    // shortcut: the host heap's addresses lie above 2^40, unlike the
-    // console's; nothing seen builds ray-tracing structures in this memory
-    // (Grand Theft Auto VI uses its GPU heap). Sub-allocate from a
-    // reservation below 2^40 if one does.
+    // The host heap's addresses lie above 2^40, unlike the console's, whose
+    // GPU addresses are 40 bits: graphics memory (a memory type set, or a
+    // block of 64 KiB or more) comes from below 2^40. FSR 4 in Series S mode
+    // makes its buffers here; at 0x22c1c280000 its passes got a truncated
+    // address and the device was removed (RTX 5060 Ti, every run).
+    if attributes >> MEMORY_TYPE_SHIFT & 0xf != 0 || layout.size() >= 64 << 10 {
+        let block = low_alloc(layout.size());
+        if !block.is_null() {
+            // SAFETY: the block holds the alignment and then `size` bytes.
+            unsafe {
+                let user = block.add(layout.align());
+                user.sub(HEADER)
+                    .cast::<[usize; 2]>()
+                    .write([layout.size(), layout.align() | LOW]);
+                return user.cast();
+            }
+        }
+    }
     // SAFETY: the layout has a non-zero size.
     let block = unsafe { alloc(layout) };
     if block.is_null() {
@@ -331,6 +375,10 @@ pub extern "system" fn XMemFreeDefault(address: *mut c_void, attributes: u64) {
         }
         let user = address.cast::<u8>();
         let [size, align] = user.sub(HEADER).cast::<[usize; 2]>().read();
+        if align & LOW != 0 {
+            VirtualFree(user.sub(align & !LOW).cast(), 0, MEM_RELEASE);
+            return;
+        }
         dealloc(
             user.sub(align),
             Layout::from_size_align_unchecked(size, align),

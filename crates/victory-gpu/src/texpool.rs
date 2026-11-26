@@ -141,7 +141,12 @@ pub(crate) fn place(
     if info.SizeInBytes == 0 || info.SizeInBytes > LARGEST || info.Alignment > 64 << 10 {
         return None;
     }
-    let size = class(info.SizeInBytes);
+    // Slots lie at multiples of their size, so a size that is a multiple of
+    // the texture's alignment keeps every slot aligned: a texture that may
+    // not have 4 KiB alignment (most detailed level over 64 KiB of tiles) is
+    // 64 KiB aligned even when small, and was placed at 4 KiB steps (NVIDIA
+    // then removed the device: invalid call, no list in flight).
+    let size = class(info.SizeInBytes).next_multiple_of(info.Alignment.max(4 << 10));
     let (slot, memory) = slot((size, false), |bytes| {
         let heap = D3D12_HEAP_DESC {
             SizeInBytes: bytes,

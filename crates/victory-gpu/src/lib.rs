@@ -20,6 +20,11 @@ mod capture;
 #[cfg(windows)]
 mod card;
 pub mod console;
+/// AMD FidelityFX on the host GPU for the title's upscaler calls (from
+/// PastiiJay/klbf-lab, by way of avatarmanz/VIctory-7900XTX): the console
+/// FSR 4 DLL removes an NVIDIA device in Series S mode.
+#[cfg(windows)]
+pub mod ffx;
 #[cfg(all(windows, feature = "diagnostics"))]
 mod copystat;
 #[cfg(all(windows, feature = "diagnostics"))]

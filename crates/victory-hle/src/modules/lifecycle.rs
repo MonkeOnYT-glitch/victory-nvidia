@@ -74,6 +74,7 @@ pub extern "system" fn CreateWindowExW(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, x, y) = placed(parent, ex_style, x, y);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExW(
@@ -100,6 +101,7 @@ pub extern "system" fn CreateWindowExA(
     param: *const c_void,
 ) -> HWND {
     let (x, y, width, height) = fit(parent, x, y, width, height);
+    let (ex_style, x, y) = placed(parent, ex_style, x, y);
     // SAFETY: the title's own arguments, forwarded (the size fitted).
     let hwnd = unsafe {
         wm::CreateWindowExA(
@@ -108,6 +110,23 @@ pub extern "system" fn CreateWindowExA(
     };
     hook(hwnd);
     hwnd
+}
+
+/// `VICTORY_WINDOW_AT=<x>,<y>`: a top-level title window opens there (on a
+/// virtual monitor, say) and never takes focus (`WS_EX_NOACTIVATE`), so a run
+/// stepped by `VICTORY_KEYS_FILE` leaves the other screens to their user.
+fn placed(parent: HWND, ex_style: u32, x: i32, y: i32) -> (u32, i32, i32) {
+    const WS_EX_NOACTIVATE: u32 = 0x0800_0000;
+    static AT: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    let at = *AT.get_or_init(|| {
+        let v = std::env::var("VICTORY_WINDOW_AT").ok()?;
+        let (a, b) = v.split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    });
+    match at {
+        Some((ax, ay)) if parent.is_null() => (ex_style | WS_EX_NOACTIVATE, ax, ay),
+        _ => (ex_style, x, y),
+    }
 }
 
 /// A console title sizes its window to its render target (Grand Theft

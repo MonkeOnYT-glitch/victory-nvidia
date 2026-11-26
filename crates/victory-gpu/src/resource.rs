@@ -1077,6 +1077,16 @@ pub(crate) fn host_transition(this: This, wanted: u32) -> Option<(*mut c_void, u
     (before != wanted).then(|| (host.texture.as_raw(), before))
 }
 
+/// The format the title gave a resource (its host copy may differ: a
+/// written shared-exponent texture is R32_UINT on the host).
+#[cfg(windows)]
+pub(crate) fn title_format(this: This) -> u32 {
+    if this.is_null() {
+        return 0;
+    }
+    resource(this).desc.format
+}
+
 /// The host GPU's copy of a title resource, if it has one.
 #[cfg(windows)]
 pub(crate) fn host_resource<'a>(
@@ -1261,7 +1271,9 @@ fn host_texture(
     // unordered access left its list unclosable). The title writes such
     // images as 32-bit integers: made as R32_UINT, castable to R9G9B9E5 for
     // the views that read it.
-    let shared_written = d.format == SHARED_EXPONENT && d.flags & (RENDER_TARGET | UNORDERED) != 0;
+    let shared_written = d.format == SHARED_EXPONENT
+        && d.flags & (RENDER_TARGET | UNORDERED) != 0
+        && std::env::var_os("VICTORY_SHARED_AS_R32").is_none_or(|v| v != "0");
     if shared_written {
         const R32_UINT: u32 = 42;
         d.format = R32_UINT;

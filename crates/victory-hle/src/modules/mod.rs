@@ -17,6 +17,8 @@ pub mod dsp;
 #[cfg(windows)]
 pub mod dstorage;
 #[cfg(windows)]
+pub mod ffx;
+#[cfg(windows)]
 pub mod dualsense;
 #[cfg(windows)]
 pub mod files;
@@ -62,6 +64,12 @@ pub(crate) fn all() -> Vec<HleModule> {
     all.push(media::module());
     #[cfg(windows)]
     all.push(dstorage::module());
+    // The title's FidelityFX calls on the host GPU (VICTORY_FFX_DIR or
+    // VICTORY_FFX_SIMPLE): the console FSR 4 DLL removes an NVIDIA device.
+    #[cfg(windows)]
+    if victory_gpu::ffx::enabled() {
+        all.push(ffx::module());
+    }
     #[cfg(windows)]
     all.push(files::module());
     #[cfg(windows)]

@@ -1875,9 +1875,24 @@ fn sparse_buffer(start: u64, len: u64, of: Option<Arc<Shadow>>) -> Option<Shadow
     })
 }
 
+/// Whether title memory may have sparse copies (`VICTORY_SPARSE=0`: plain
+/// copies only). Their tiles live in CPU-visible heaps mapped with
+/// `UpdateTileMappings`, which cannot fail: a driver that does not take such
+/// a mapping removes the device instead.
+fn sparse_allowed() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| {
+        let on = std::env::var_os("VICTORY_SPARSE").is_none_or(|v| v != "0");
+        if !on {
+            tracing::info!("no sparse copies of title memory (VICTORY_SPARSE=0)");
+        }
+        on
+    })
+}
+
 /// The sparse copy `[address, end)` lies in.
 fn sparse(address: u64, end: u64) -> Option<Arc<Shadow>> {
-    if cfg!(test) || (end - 1) / CHUNK != address / CHUNK {
+    if cfg!(test) || (end - 1) / CHUNK != address / CHUNK || !sparse_allowed() {
         return None;
     }
     SPARSE

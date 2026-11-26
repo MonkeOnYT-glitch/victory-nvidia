@@ -485,6 +485,14 @@ impl State {
         }
     }
 
+    /// After host work that bound its own pipeline, roots and heaps on the
+    /// list (the upscaler): the next draw or dispatch binds the title's again.
+    pub(crate) fn forget_host(&mut self) {
+        self.host_pipeline = 0;
+        self.host_roots = [0; 2];
+        self.host_heaps = [0; 2];
+    }
+
     /// Goes on in another host list, open: gives it the state set so far.
     pub(crate) fn continue_in(&mut self, list: &HostList) {
         self.host_pipeline = 0;

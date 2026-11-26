@@ -4357,13 +4357,23 @@ fn make_window(width: u32, height: u32) -> windows::core::Result<HWND> {
             bottom: height as i32,
         };
         AdjustWindowRect(&mut rect, WS_OVERLAPPEDWINDOW, false)?;
+        // `VICTORY_WINDOW_AT=<x>,<y>`: opened there (a virtual monitor), never
+        // taking focus, so the other screens stay their user's.
+        let at = std::env::var("VICTORY_WINDOW_AT").ok().and_then(|v| {
+            let (a, b) = v.split_once(',')?;
+            Some((a.trim().parse::<i32>().ok()?, b.trim().parse::<i32>().ok()?))
+        });
+        let (ex, x, y) = match at {
+            Some((x, y)) => (WS_EX_NOACTIVATE, x, y),
+            None => (WINDOW_EX_STYLE(0), CW_USEDEFAULT, CW_USEDEFAULT),
+        };
         CreateWindowExW(
-            WINDOW_EX_STYLE(0),
+            ex,
             CLASS,
             w!("VIctory"),
             WS_OVERLAPPEDWINDOW | WS_VISIBLE,
-            CW_USEDEFAULT,
-            CW_USEDEFAULT,
+            x,
+            y,
             rect.right - rect.left,
             rect.bottom - rect.top,
             None,
@@ -4515,7 +4525,12 @@ fn wait_if_removed(device: &ID3D12Device, error: &windows::core::Error) {
     ONCE.call_once(|| {
         // SAFETY: a plain query.
         let reason = unsafe { device.GetDeviceRemovedReason() };
-        tracing::error!(?reason, layer = ?host().and_then(|h| h.log_messages()), "host GPU device gone");
+        // The faulting address and the lists' breadcrumbs too: the thread that
+        // runs submissions did not always get to report them (a removal while
+        // a resource was made left the run waiting here, RTX 5060 Ti).
+        let dred = host().map(|h| h.removal_data(&[])).unwrap_or_default();
+        let making = crate::pipeline::host::making();
+        tracing::error!(?reason, layer = ?host().and_then(|h| h.log_messages()), dred, ?making, "host GPU device gone");
     });
     std::thread::sleep(std::time::Duration::from_secs(20));
 }
