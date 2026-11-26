@@ -152,7 +152,10 @@ pub(crate) fn wanted(n: u64) -> bool {
     // run, so single frames cannot be compared between runs).
     let first = WORLD.load(std::sync::atomic::Ordering::Relaxed);
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
-    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world)
+    // A file `want` in the folder: this frame too, once (a script asking for
+    // what is on screen now).
+    let asked = folder().is_some_and(|f| std::fs::remove_file(f.join("want")).is_ok());
+    folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || asked)
 }
 
 /// Saves 8-bit RGBA or BGRA rows (`pitch` bytes apart) as frame `n`.

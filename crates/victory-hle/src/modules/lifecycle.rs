@@ -161,6 +161,16 @@ fn place(
     height: i32,
 ) -> (u32, u32, (i32, i32, i32, i32)) {
     let fitted = fit(parent, x, y, width, height);
+    // `VICTORY_WINDOW_AT=<x>,<y>`: a top-level window opens there (a virtual
+    // monitor), framed, never full screen and never taking focus, so a run
+    // stepped by `VICTORY_KEYS_FILE` leaves the other screens to their user.
+    if let Some((ax, ay)) = window_at()
+        && parent.is_null()
+        && style & wm::WS_CHILD == 0
+    {
+        let (_, _, w, h) = fitted;
+        return (ex_style | wm::WS_EX_NOACTIVATE, style, (ax, ay, w, h));
+    }
     // SAFETY: plain queries of the primary monitor's size.
     let screen = unsafe { (wm::GetSystemMetrics(wm::SM_CXSCREEN), wm::GetSystemMetrics(wm::SM_CYSCREEN)) };
     let full = full_screen(ex_style, style, !parent.is_null(), screen);
@@ -179,6 +189,16 @@ fn place(
     (ex_style, style, fitted)
 }
 
+/// `VICTORY_WINDOW_AT=<x>,<y>`, parsed once.
+pub(crate) fn window_at() -> Option<(i32, i32)> {
+    static AT: std::sync::OnceLock<Option<(i32, i32)>> = std::sync::OnceLock::new();
+    *AT.get_or_init(|| {
+        let v = std::env::var("VICTORY_WINDOW_AT").ok()?;
+        let (a, b) = v.split_once(',')?;
+        Some((a.trim().parse().ok()?, b.trim().parse().ok()?))
+    })
+}
+
 /// The styles and place the title's top-level window had (or would have
 /// had) as a window, for going back from full screen.
 type Windowed = (u32, u32, (i32, i32, i32, i32));
@@ -190,6 +210,10 @@ static FULL_SCREEN: AtomicBool = AtomicBool::new(false);
 /// monitor it is on) or back to the window it was made as, whichever it is
 /// not now. The swap chain stretches to either.
 fn toggle_full_screen(hwnd: HWND) {
+    // A window kept on its monitor (`VICTORY_WINDOW_AT`) never goes full screen.
+    if window_at().is_some() {
+        return;
+    }
     let Some(windowed) = *WINDOWED.lock().unwrap_or_else(|e| e.into_inner()) else { return };
     let full = FULL_SCREEN.load(std::sync::atomic::Ordering::Relaxed);
     // SAFETY: queries of the title's window and the monitor it is on.
