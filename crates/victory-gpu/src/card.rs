@@ -939,6 +939,23 @@ fn transition_barrier(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
+    // As `host::transition`: states the resource's flags allow (NVIDIA refuses
+    // others), and no transition between equal states.
+    let (before, after) = (
+        D3D12_RESOURCE_STATES(crate::host::legal_state(resource, before.0 as u32) as i32),
+        D3D12_RESOURCE_STATES(crate::host::legal_state(resource, after.0 as u32) as i32),
+    );
+    if before == after {
+        return D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    pResource: std::mem::ManuallyDrop::new(Some(resource.clone())),
+                }),
+            },
+        };
+    }
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

@@ -4269,6 +4269,28 @@ pub(crate) fn transition(
     before: D3D12_RESOURCE_STATES,
     after: D3D12_RESOURCE_STATES,
 ) -> D3D12_RESOURCE_BARRIER {
+    // Both states as the resource's flags allow them ([`legal_state`]): NVIDIA's
+    // driver refuses a list with a barrier to a state its flags lack ("Missing
+    // resource bind flags", the list does not close) where AMD's let it pass;
+    // FSR 4 in Series S mode did so on the first world frame. A barrier that is
+    // then no change at all is a UAV barrier instead (same before and after is
+    // refused too), which only orders the work around it.
+    let (before, after) = (
+        D3D12_RESOURCE_STATES(legal_state(resource, before.0 as u32) as i32),
+        D3D12_RESOURCE_STATES(legal_state(resource, after.0 as u32) as i32),
+    );
+    if before == after {
+        return D3D12_RESOURCE_BARRIER {
+            Type: D3D12_RESOURCE_BARRIER_TYPE_UAV,
+            Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,
+            Anonymous: D3D12_RESOURCE_BARRIER_0 {
+                UAV: std::mem::ManuallyDrop::new(D3D12_RESOURCE_UAV_BARRIER {
+                    // SAFETY: a borrowed pointer; the barrier never releases it.
+                    pResource: unsafe { std::mem::transmute_copy(resource) },
+                }),
+            },
+        };
+    }
     D3D12_RESOURCE_BARRIER {
         Type: D3D12_RESOURCE_BARRIER_TYPE_TRANSITION,
         Flags: D3D12_RESOURCE_BARRIER_FLAG_NONE,

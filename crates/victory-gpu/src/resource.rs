@@ -1245,7 +1245,7 @@ fn host_texture(
     }
     // The clear value names the format too: format, then color or depth
     // and stencil (5 words).
-    let clear_value = (!clear.is_null()).then(|| {
+    let mut clear_value = (!clear.is_null()).then(|| {
         // SAFETY: the title passes a whole clear value.
         let mut value = unsafe { clear.cast::<[u32; 5]>().read_unaligned() };
         value[0] = if d.flags & (RENDER_TARGET | UNORDERED) != 0 {
@@ -1255,6 +1255,20 @@ fn host_texture(
         };
         value
     });
+    // A shared-exponent texture that is written (FSR 4's output in Series S
+    // mode): no host GPU renders to R9G9B9E5 or writes it typed (NVIDIA
+    // refuses both; the texture lost both uses and the first barrier to
+    // unordered access left its list unclosable). The title writes such
+    // images as 32-bit integers: made as R32_UINT, castable to R9G9B9E5 for
+    // the views that read it.
+    let shared_written = d.format == SHARED_EXPONENT && d.flags & (RENDER_TARGET | UNORDERED) != 0;
+    if shared_written {
+        const R32_UINT: u32 = 42;
+        d.format = R32_UINT;
+        if let Some(value) = clear_value.as_mut() {
+            value[0] = R32_UINT;
+        }
+    }
     let heap = D3D12_HEAP_PROPERTIES {
         Type: D3D12_HEAP_TYPE_DEFAULT,
         ..Default::default()
@@ -1292,8 +1306,7 @@ fn host_texture(
     if let Some((texture, slot)) = crate::texpool::place(&host.device, &desc, first) {
         return Some((texture, Some(slot), skip, false));
     }
-    if (39..=43).contains(&d.format)
-        && d.flags & UNORDERED != 0
+    if ((39..=43).contains(&d.format) && d.flags & UNORDERED != 0 || shared_written)
         && let Some(texture) = castable(
             &host.device,
             &desc,
