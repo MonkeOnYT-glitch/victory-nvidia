@@ -3576,7 +3576,12 @@ impl Presenter {
             device.CreateRenderTargetView(back, None, view);
             if behind.right <= self.width as i32 && behind.bottom <= self.height as i32 {
                 list.ClearRenderTargetView(view, &[0.0, 0.0, 0.0, 1.0], Some(&[behind]));
-                list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(&marks));
+                // A few rectangles a call: NVIDIA's driver copies a clear's
+                // rectangles onto its stack and overruns it with hundreds
+                // (fail-fast 0xC0000409 in nvwgf2umx.dll on the first frame).
+                for some in marks.chunks(16) {
+                    list.ClearRenderTargetView(view, &[1.0, 0.9, 0.1, 1.0], Some(some));
+                }
             }
         }
     }
