@@ -93,6 +93,7 @@ mod lds_tests;
 #[cfg(all(test, windows))]
 mod lane_read_loop_tests;
 mod lower;
+pub use lower::wave_approx;
 mod rectangle;
 #[cfg(test)]
 mod opcode_audit;

@@ -63,6 +63,8 @@ fn build() -> &'static [u8; 32] {
             Ok(mut bytes) => {
                 bytes.extend_from_slice(&limit.to_le_bytes());
                 bytes.push(victory_shader::emit::rays().into());
+                // Approximate wave64 splits are another translation.
+                bytes.push(victory_shader::emit::wave_approx().into());
                 *blake3::hash(&bytes).as_bytes()
             }
             Err(e) => {

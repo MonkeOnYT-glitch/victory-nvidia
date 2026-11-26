@@ -162,6 +162,13 @@ thread_local! {
 ///   it keeps the per-lane form ([`Parts::per_lane_only`]).
 pub(crate) const CONSOLE_FLOW: &str = "a wave64 program whose halves exchange lanes (console flow)";
 
+/// `VICTORY_WAVE_APPROX=1`: wave64 programs that read across their halves run
+/// split anyway, approximately (see where `split` is decided).
+pub fn wave_approx() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_WAVE_APPROX").is_some_and(|v| v == "1"))
+}
+
 enum Stop {
     /// A phi whose incoming value has no DXIL form was read: redo with it missing.
     Retry(Value, Why),
@@ -1190,6 +1197,23 @@ impl<'a> Lower<'a> {
                 && !x.target.runs(64)
                 && x.target.runs(32)
                 && (0..p.blocks.len()).all(|b| super::wave::sections(p, b).is_empty());
+            // `VICTORY_WAVE_APPROX=1`: the rest of such programs without LDS
+            // split too, APPROXIMATE: a mask read whole, a lane of the other
+            // half or a whole-wave reduction sees its own host wave of 32 only.
+            // Their passes run instead of being dropped (drops left whole
+            // passes unwritten: false colour on NVIDIA), with no group barrier
+            // that could hang the card. Groups of several console waves too.
+            if !split
+                && wave_approx()
+                && console_lanes
+                && x.native.wave64
+                && s.lds_dwords == 0
+                && !x.target.runs(64)
+                && x.target.runs(32)
+                && !insts().any(|i| i.name().contains("permute"))
+            {
+                split = true;
+            }
             // The rest of such programs need the halves to exchange values
             // (masks read whole, lanes of the other half): the console flow,
             // for a group of one console wave without LDS.
@@ -1847,7 +1871,8 @@ impl<'a> Lower<'a> {
         if self.mask_data == MaskData::None {
             return Err("a wave reduction in a mesh shader");
         }
-        if self.split {
+        // APPROXIMATE (`VICTORY_WAVE_APPROX=1`): over the half's 32 lanes.
+        if self.split && !wave_approx() {
             return Err("a wave reduction in a wave64 program split in halves");
         }
         let c = self.cur;
@@ -3040,7 +3065,9 @@ impl<'a> Lower<'a> {
             self.ballots.insert(lo, xy);
             return Ok(xy);
         }
-        if self.split {
+        // APPROXIMATE (`VICTORY_WAVE_APPROX=1`): the ballot of the host wave
+        // below, the half's own 32 lanes.
+        if self.split && !wave_approx() {
             return Err("a lane mask read whole in a wave64 program split in halves");
         }
         if !self.x.st.active.contains(&lo) {
