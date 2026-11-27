@@ -53,6 +53,13 @@ What it adds:
   woken (256 upstream). With all of them there, the submitting thread's work fell
   from 71-85 to 61-63 ms a frame and the title's wait at presents from 39 to 29 ms;
   the cutscene's own swings (14-17 fps) hide the frame-rate change in one run.
+- **Lighting without the structure builder**: `VICTORY_RT_MISS=1 VICTORY_RT_RESOLVE=1
+  VICTORY_ACTIVATE_RAYS=1 VICTORY_RT_TRACE=1`. The ray-tracing resolve and probe
+  passes were left out when no structures are built, and that left surfaces that
+  only get indirect light (the cell's walls) black, whatever stand-in was set.
+  Run with every ray a miss they give the title's own light: dark hair instead of
+  glowing, the yard lit, sunlight on the walls; 17.5-19.1 fps (release), as
+  without. Some banding remains in that light.
 - **Textures the card has no room for are made at low resolution** (none of their
   levels over 64 KiB) instead of being refused, which showed them black: walls,
   the cell window, the yard and cloth. 23,621 such textures in the prison yard,
