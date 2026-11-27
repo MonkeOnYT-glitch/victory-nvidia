@@ -8665,10 +8665,19 @@ impl Batch {
         let before = [0, 2].map(|i| PREPARING[i].load(Ordering::Relaxed));
         // Those known to copy nothing are said so here, unless they are very
         // many: then beside the others.
+        // `VICTORY_REFRESH_FEW=<n>`: up to this many are sorted out here
+        // (256 before). Checked on the threads beside, spans of one copy
+        // take turns at its locks (`pending`, `copied`), and a check is
+        // about a microsecond; here they need none of the threads' hand-offs.
+        static FEW_AT: std::sync::OnceLock<usize> = std::sync::OnceLock::new();
+        let few = *FEW_AT.get_or_init(|| {
+            std::env::var("VICTORY_REFRESH_FEW").ok().and_then(|v| v.trim().parse().ok()).unwrap_or(256)
+        });
         const FEW: usize = 256;
+        let _ = FEW;
         let mut spans = spans;
         // (Renderer port #6: on the threads beside, whatever their number.)
-        let many = spans.len() > FEW || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
+        let many = spans.len() > few || crate::watch::port_guard_plan() && spans.len() + due.len() >= 4;
         if !many {
             let _known = crate::timeline::span("refreshes in front: those known to copy nothing");
             #[cfg(feature = "diagnostics")]
