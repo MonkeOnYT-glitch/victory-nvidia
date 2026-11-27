@@ -151,13 +151,13 @@ impl Pending {
     }
 }
 
-/// Why a pipeline has no host pipeline (diagnostics): its shaders that do
-/// not translate, else "refused" or "being made"; `None` if it has one.
+/// Reports why a host pipeline was left out, is pending, or failed to build.
+/// Returns `None` when the host pipeline is ready.
 #[cfg(feature = "diagnostics")]
 pub(crate) fn missing(p: &Pending) -> Option<String> {
     match p.made.get() {
         Some(Some(_)) => None,
-        None => Some("being made".into()),
+        None => Some(p.left_out.unwrap_or("being made").into()),
         Some(None) => {
             let failed: Vec<String> = p
                 .shaders
@@ -561,6 +561,19 @@ fn drained() {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[cfg(feature = "diagnostics")]
+    #[test]
+    fn missing_distinguishes_omitted_and_pending_pipelines() {
+        let reason = "ray activation shader without BVH, left out";
+        let mut omitted = Pending::new(Vec::new(), None);
+        omitted.left_out = Some(reason);
+        assert_eq!(missing(&omitted).as_deref(), Some(reason));
+
+        let pending = Pending::new(Vec::new(), None);
+        pending.queue_state.store(MAKING, Ordering::Relaxed);
+        assert_eq!(missing(&pending).as_deref(), Some("being made"));
+    }
 
     #[test]
     fn worker_count_follows_the_processors_and_the_switch() {

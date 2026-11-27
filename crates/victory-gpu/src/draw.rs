@@ -479,6 +479,9 @@ fn argument_copies(first: &std::sync::Arc<crate::shadow::Shadow>) -> Vec<(u64, I
 #[derive(Default)]
 pub(crate) struct State {
     pipeline: usize,
+    /// Set at the leaf that refused preparation, including table and root views.
+    #[cfg(feature = "diagnostics")]
+    prepare_failure: crate::pipeline::PrepareFailure,
     /// View heap, sampler heap.
     heaps: [usize; 2],
     graphics: Vec<Root>,
@@ -884,6 +887,37 @@ pub(crate) static HEAP_TEXTURES_QUEUE: [AtomicU64; 5] = [const { AtomicU64::new(
 pub(crate) static HEAP_TEXTURES_PARTLY: [AtomicU64; 3] = [const { AtomicU64::new(0) }; 3];
 static DROPPED: AtomicU64 = AtomicU64::new(0);
 
+/// `n` consecutive dynamic slots of `host` ([`crate::descriptor::host::HostHeap::dynamic`]).
+/// With none free, the flights in the air are landed first, which gives
+/// back the slots of their lists, and the slots are asked for again.
+/// `None`: refused again; the caller drops its draw or dispatch.
+///
+/// With submissions sent ahead (`crate::host::late`) the landing waits
+/// until nothing is in the air, and it is counted as a blocking fence wait;
+/// diagnostics builds count these waits and the tables refused after them
+/// apart (the frame line's "dynamic slots"), so that a wait for slots is
+/// not taken for the title's.
+fn dynamic_or_settle(host: &crate::descriptor::host::HostHeap, n: u32) -> Option<u32> {
+    if let Some(first) = host.dynamic(n) {
+        return Some(first);
+    }
+    #[cfg(feature = "diagnostics")]
+    let started = std::time::Instant::now();
+    crate::host::settle_for_fence();
+    #[cfg(feature = "diagnostics")]
+    {
+        use crate::copystat::{C, add};
+        add(C::DynamicSettles, 1);
+        add(C::DynamicSettleUs, started.elapsed().as_micros() as u64);
+    }
+    let first = host.dynamic(n);
+    #[cfg(feature = "diagnostics")]
+    if first.is_none() {
+        crate::copystat::add(crate::copystat::C::DynamicLost, 1);
+    }
+    first
+}
+
 /// Marks the last traced draw as not run on the host.
 #[cfg(feature = "diagnostics")]
 fn dropped(pipeline: usize) {
@@ -939,6 +973,17 @@ macro_rules! once {
     ($($arg:tt)*) => {{
         static ONCE: std::sync::Once = std::sync::Once::new();
         ONCE.call_once(|| tracing::warn!($($arg)*));
+    }};
+}
+
+// Ordinary builds retain the original boolean failure, with no trace state.
+macro_rules! prepare_failed {
+    ($state:expr, $why:ident) => {{
+        #[cfg(feature = "diagnostics")]
+        {
+            $state.prepare_failure = crate::pipeline::PrepareFailure::$why;
+        }
+        false
     }};
 }
 
@@ -1538,14 +1583,14 @@ impl State {
     fn prepare_for(&mut self, list: &HostList, indexed: bool, mesh: bool) -> bool {
         #[cfg(feature = "diagnostics")]
         if crate::pipeline::is_skipped(self.pipeline as This) {
-            return false;
+            return prepare_failed!(self, SkippedPipeline);
         }
         let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
-            return false;
+            return prepare_failed!(self, MissingHostPipeline);
         };
         if p.compute || p.mesh != mesh {
             once!(mesh, "a draw or mesh dispatch with another kind of pipeline");
-            return false;
+            return prepare_failed!(self, PipelineKind);
         }
         if p.rects && self.topology != RECTANGLES {
             // Its geometry stage would turn each triangle into a rectangle.
@@ -1585,7 +1630,7 @@ impl State {
         if indexed {
             let v = self.index;
             let Some(shadow) = crate::shadow::find_any(v.address, u64::from(v.size)) else {
-                return false;
+                return prepare_failed!(self, IndexBuffer);
             };
             shadow.refresh(list, v.address, u64::from(v.size));
             let view = D3D12_INDEX_BUFFER_VIEW {
@@ -1726,7 +1771,7 @@ impl State {
             STORES.set(true);
             if made.iter().any(|m| m.1 == u32::MAX) {
                 once!("a draw whose descriptor table found no free slots is dropped");
-                return false;
+                return prepare_failed!(self, DynamicDescriptorTable);
             }
             if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
                 self.ambient_tables.clear();
@@ -1747,7 +1792,7 @@ impl State {
                 };
                 let Some(ready) = self.memory_ready(list, t, compute, use_) else {
                     once!("a shader that reads title memory by address without a view heap to hold its views: the draw is dropped");
-                    return false;
+                    return prepare_failed!(self, ShaderMemoryViews);
                 };
                 Some(ready)
             } else {
@@ -1972,7 +2017,7 @@ impl State {
         if !crate::pipeline::host::bounded_root_srvs() {
             let Some((a, s)) = address.and_then(|a| Some((a, find(a)?))) else {
                 once!("a root UAV with nothing to bind: the draw is dropped");
-                return false;
+                return prepare_failed!(self, RootUavBuffer);
             };
             ready(a, &s);
             // From the 16 bytes below: the shader adds the rest.
@@ -1995,18 +2040,15 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root UAV without a bound view heap: the draw is dropped");
-            return false;
+            return prepare_failed!(self, RootUavHeap);
         };
         let key = (std::ptr::from_ref(heap) as usize, address.unwrap_or(0));
         let (index, shadow) = match self.root_uav_slots.get(&key) {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| find(a).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
-                    return false;
+                let Some(index) = dynamic_or_settle(host, 1) else {
+                    return prepare_failed!(self, RootUavSlot);
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
                 if let Some((a, s)) = &shadow {
@@ -2064,7 +2106,7 @@ impl State {
         };
         let Some((heap, host)) = heap.and_then(|h| Some((h, h.host()?))) else {
             once!("a root SRV without a bound view heap: the draw is dropped");
-            return false;
+            return prepare_failed!(self, RootSrvHeap);
         };
         // A view that begins early is another view than one that does not
         // (title addresses stay below bit 63).
@@ -2076,11 +2118,8 @@ impl State {
             Some((index, shadow)) => (*index, address.zip(shadow.clone())),
             None => {
                 let shadow = address.and_then(|a| crate::shadow::find(a, 1).map(|s| (a, s)));
-                let Some(index) = host.dynamic(1).or_else(|| {
-                    crate::host::settle_for_fence();
-                    host.dynamic(1)
-                }) else {
-                    return false;
+                let Some(index) = dynamic_or_settle(host, 1) else {
+                    return prepare_failed!(self, RootSrvSlot);
                 };
                 self.dynamic.push((key.0, host.id(), index, 1));
                 self.root_srv_slots
@@ -3924,10 +3963,7 @@ impl State {
                 made.push((slot, first * 32));
                 continue;
             }
-            let Some(first) = host.dynamic(n).or_else(|| {
-                crate::host::settle_for_fence();
-                host.dynamic(n)
-            }) else {
+            let Some(first) = dynamic_or_settle(host, n) else {
                 // No room: the draw must not run with the title's own
                 // offsets (slots never made for it); `bind` drops it.
                 made.push((slot, u32::MAX));
@@ -4577,9 +4613,17 @@ impl State {
             DRAW | INDEXED => self.prepare(list, kind == INDEXED),
             MESH => self.prepare_for(list, false, true),
             DISPATCH => self.bind(list, p, true),
-            _ => false,
+            _ => prepare_failed!(self, PipelineKind),
         };
         if !ran {
+            #[cfg(feature = "diagnostics")]
+            crate::pipeline::note_indirect_prepare(
+                self.pipeline as This,
+                std::mem::take(&mut self.prepare_failure),
+                (kind, stride, max),
+                (&args, arguments),
+                counter.as_ref(),
+            );
             why("prepare failed");
             return false;
         }

@@ -1197,6 +1197,14 @@ impl TextureQueue {
         self.slots.get_mut(&index).filter(|w| w.write == write)
     }
 
+    /// Replacing a retry also clears a card-space hold for the same write.
+    fn reschedule(&mut self, index: u32, write: u64) -> Option<&mut Waiting> {
+        if self.held.get(&index) == Some(&write) {
+            self.held.remove(&index);
+        }
+        self.same(index, write)
+    }
+
     /// Slot `index` is up to date: out of the queue until written again.
     fn done(&mut self, index: u32, write: u64) {
         if self.same(index, write).is_some() {
@@ -1207,7 +1215,7 @@ impl TextureQueue {
     /// Nothing to upload at slot `index` now: looked at again after 1, 2,
     /// 4, ... frames, at most `most`.
     fn later(&mut self, index: u32, write: u64, frame: u64, most: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             w.due = frame + (1u64 << w.looks.min(16)).min(most.max(1));
             w.looks = w.looks.saturating_add(1);
             w.away = crate::host::now_ms();
@@ -1248,7 +1256,7 @@ impl TextureQueue {
     /// Slot `index` was uploaded with `mapped` bytes of its memory there,
     /// not all of it: looked at again from frame `due`.
     fn partly(&mut self, index: u32, write: u64, due: u64, mapped: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 0, mapped.max(1));
         }
     }
@@ -1259,7 +1267,7 @@ impl TextureQueue {
     /// `looks`-th such look; `uploaded` is the upload's frame).
     #[allow(clippy::too_many_arguments)]
     fn recheck(&mut self, index: u32, write: u64, due: u64, at: (u64, u64), print: u64, looks: u8, uploaded: u64) {
-        if let Some(w) = self.same(index, write) {
+        if let Some(w) = self.reschedule(index, write) {
             (w.due, w.looks, w.mapped) = (due, 1, 0);
             w.checked = (at.0, at.1, print, looks, uploaded);
         }
@@ -1987,6 +1995,9 @@ impl HostHeap {
             {
                 use crate::copystat::{C, add};
                 add(C::DynamicRefused, 1);
+                if self.in_pieces(n as u32) {
+                    add(C::DynamicPieces, 1);
+                }
                 add(C::DynamicNs, started.elapsed().as_nanos() as u64);
             }
             return None;
@@ -2001,6 +2012,14 @@ impl HostHeap {
         self.free.fetch_sub(n as u32, std::sync::atomic::Ordering::Relaxed);
         *next = ((first + n) % end) as u32;
         Some(self.count + first as u32)
+    }
+
+    /// Whether `n` dynamic slots are free in all: when [`HostHeap::dynamic`]
+    /// refuses `n` all the same, the free ones are in pieces, none `n`
+    /// together; otherwise they are taken (by lists not yet run).
+    #[cfg_attr(not(feature = "diagnostics"), allow(dead_code))]
+    fn in_pieces(&self, n: u32) -> bool {
+        self.free.load(std::sync::atomic::Ordering::Relaxed) >= n
     }
 
     /// The title slots this heap has host slots for; fewer than the title's
@@ -5986,6 +6005,36 @@ mod tests {
         assert_eq!(q.room(6), 0);
     }
 
+    #[test]
+    fn card_room_preserves_texture_retries_after_a_hold() {
+        let mut q = TextureQueue::default();
+        for index in 1..=4 {
+            q.written(index, 0, 0, false);
+        }
+        let due = q.due(0, 4);
+        for &(index, write) in &due {
+            q.hold(index, write, 4);
+        }
+        assert!(q.due(3, 4).is_empty());
+        assert_eq!(q.due(4, 4), due);
+
+        for (index, write) in due {
+            match index {
+                1 => q.later(index, write, 4, 8),
+                2 => q.partly(index, write, 8, 4),
+                3 => q.recheck(index, write, 10, (16, 8), 1, 0, 4),
+                _ => q.hold(index, write, 12),
+            }
+        }
+
+        assert_eq!(q.room(4), 1);
+        let due_slots = |frame| q.due(frame, 4).into_iter().map(|(index, _)| index).collect::<std::collections::BTreeSet<_>>();
+        assert_eq!(due_slots(4), [4].into());
+        assert_eq!(due_slots(5), [1, 4].into());
+        assert_eq!(due_slots(8), [1, 2, 4].into());
+        assert_eq!(due_slots(10), [1, 2, 3, 4].into());
+    }
+
     /// Textures of which only the smallest levels are held, packed into
     /// one another's address range (the three of run 188: 0x2c000 bytes
     /// each at full size, their starts 0x2000 and 0x4000 apart): writing
@@ -6354,6 +6403,32 @@ mod tests {
         let last = first + heap.dynamic - 1;
         heap.release(heap.id(), last, 1);
         assert_eq!(heap.dynamic(2), None);
+    }
+
+    /// A refusal tells free slots in pieces from slots taken (the frame
+    /// line counts the first apart), and a run given back twice is free
+    /// once: a full pool is never taken for one in pieces.
+    #[test]
+    fn refused_slots_in_pieces_are_told_from_taken_ones() {
+        let Some(heap) = HostHeap::new(false, 4) else {
+            return; // no host GPU
+        };
+        // Every slot in runs of two (the pool is a power of two), then every
+        // other run given back: half of them free, no four together.
+        let runs: Vec<u32> = std::iter::from_fn(|| heap.dynamic(2)).collect();
+        assert_eq!(runs.len() as u32, heap.dynamic / 2);
+        assert!(!heap.in_pieces(1));
+        for &first in runs.iter().step_by(2) {
+            heap.release(heap.id(), first, 2);
+        }
+        assert_eq!(heap.dynamic(4), None);
+        assert!(heap.in_pieces(4));
+        // Given back again: nothing more is free.
+        heap.release(heap.id(), runs[0], 2);
+        let again: Vec<u32> = std::iter::from_fn(|| heap.dynamic(2)).collect();
+        assert_eq!(again.len(), runs.len().div_ceil(2));
+        assert_eq!(heap.dynamic(1), None);
+        assert!(!heap.in_pieces(1));
     }
 
     #[test]
