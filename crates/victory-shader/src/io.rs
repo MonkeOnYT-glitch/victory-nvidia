@@ -222,7 +222,12 @@ pub fn raise(p: &Program, native: &NativeProgram) -> Result<Io, ShaderError> {
                         row: i.row,
                         channel,
                     };
-                    loaded.push((Reg::V(i.vgpr + channel), input));
+                    // An attribute in a system value's VGPR replaces it (a
+                    // program that fetched its own vertices there,
+                    // `crate::pieces`; a fetch shader never loads there).
+                    let r = Reg::V(i.vgpr + channel);
+                    loaded.retain(|(x, _)| *x != r);
+                    loaded.push((r, input));
                 }
             }
             (loaded, &[][..], &outputs[..])

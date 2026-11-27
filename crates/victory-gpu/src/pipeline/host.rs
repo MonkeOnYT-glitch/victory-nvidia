@@ -1640,3 +1640,179 @@ mod tests {
         let _ = offsets(&inputs);
     }
 }
+
+/// The bound targets a pipeline handed over in pieces is made for
+/// (`crate::pipeline::create_graphics_parts`): the pieces name no formats.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
+pub(crate) struct Targets {
+    pub(crate) formats: [i32; 8],
+    pub(crate) count: u8,
+    pub(crate) depth: i32,
+    pub(crate) samples: u32,
+    /// `D3D12_PRIMITIVE_TOPOLOGY_TYPE`.
+    pub(crate) topology: u8,
+}
+
+/// A GFX10 blend factor (`CB_BLEND*_CONTROL`) as D3D12's; for the alpha
+/// channel the color factors become their alpha forms.
+fn blend_factor(f: u32, alpha: bool) -> D3D12_BLEND {
+    let b = match f {
+        0 => D3D12_BLEND_ZERO,
+        1 => D3D12_BLEND_ONE,
+        2 => D3D12_BLEND_SRC_COLOR,
+        3 => D3D12_BLEND_INV_SRC_COLOR,
+        4 => D3D12_BLEND_SRC_ALPHA,
+        5 => D3D12_BLEND_INV_SRC_ALPHA,
+        6 => D3D12_BLEND_DEST_ALPHA,
+        7 => D3D12_BLEND_INV_DEST_ALPHA,
+        8 => D3D12_BLEND_DEST_COLOR,
+        9 => D3D12_BLEND_INV_DEST_COLOR,
+        10 => D3D12_BLEND_SRC_ALPHA_SAT,
+        13 | 19 => D3D12_BLEND_BLEND_FACTOR,
+        14 | 20 => D3D12_BLEND_INV_BLEND_FACTOR,
+        15 => D3D12_BLEND_SRC1_COLOR,
+        16 => D3D12_BLEND_INV_SRC1_COLOR,
+        17 => D3D12_BLEND_SRC1_ALPHA,
+        18 => D3D12_BLEND_INV_SRC1_ALPHA,
+        _ => D3D12_BLEND_ONE,
+    };
+    if !alpha {
+        return b;
+    }
+    match b {
+        D3D12_BLEND_SRC_COLOR => D3D12_BLEND_SRC_ALPHA,
+        D3D12_BLEND_INV_SRC_COLOR => D3D12_BLEND_INV_SRC_ALPHA,
+        D3D12_BLEND_DEST_COLOR => D3D12_BLEND_DEST_ALPHA,
+        D3D12_BLEND_INV_DEST_COLOR => D3D12_BLEND_INV_DEST_ALPHA,
+        D3D12_BLEND_SRC1_COLOR => D3D12_BLEND_SRC1_ALPHA,
+        D3D12_BLEND_INV_SRC1_COLOR => D3D12_BLEND_INV_SRC1_ALPHA,
+        b => b,
+    }
+}
+
+fn blend_op(f: u32) -> D3D12_BLEND_OP {
+    match f {
+        1 => D3D12_BLEND_OP_SUBTRACT,
+        2 => D3D12_BLEND_OP_MIN,
+        3 => D3D12_BLEND_OP_MAX,
+        4 => D3D12_BLEND_OP_REV_SUBTRACT,
+        _ => D3D12_BLEND_OP_ADD,
+    }
+}
+
+fn stencil_op(f: u32) -> D3D12_STENCIL_OP {
+    match f {
+        1 => D3D12_STENCIL_OP_ZERO,
+        3 | 4 => D3D12_STENCIL_OP_REPLACE,
+        5 => D3D12_STENCIL_OP_INCR_SAT,
+        6 => D3D12_STENCIL_OP_DECR_SAT,
+        7 => D3D12_STENCIL_OP_INVERT,
+        8 => D3D12_STENCIL_OP_INCR,
+        9 => D3D12_STENCIL_OP_DECR,
+        _ => D3D12_STENCIL_OP_KEEP,
+    }
+}
+
+impl GraphicsState {
+    /// The state of a pipeline handed over in pieces, from its registers
+    /// (offsets as [`victory_shader::pieces`] lists them), its vertex
+    /// attributes and the targets of the draw.
+    pub(crate) fn from_pieces(
+        regs: &[u8],
+        elements: &[victory_shader::pieces::VertexElement],
+        t: &Targets,
+    ) -> GraphicsState {
+        let r = |at| victory_shader::pieces::register(regs, at);
+        let mut g = GraphicsState::default();
+        let mask = r(0x78);
+        g.blend.IndependentBlendEnable = true.into();
+        for n in 0..8 {
+            let c = r(0xd0 + 4 * n);
+            let rt = &mut g.blend.RenderTarget[n];
+            rt.RenderTargetWriteMask = (mask >> (4 * n) & 0xF) as u8;
+            if c >> 30 & 1 == 0 {
+                continue;
+            }
+            let separate = c >> 29 & 1 != 0;
+            let (src, op, dst) = (c & 0x1F, c >> 5 & 7, c >> 8 & 0x1F);
+            let (asrc, aop, adst) = if separate { (c >> 16 & 0x1F, c >> 21 & 7, c >> 24 & 0x1F) } else { (src, op, dst) };
+            rt.BlendEnable = true.into();
+            rt.SrcBlend = blend_factor(src, false);
+            rt.DestBlend = blend_factor(dst, false);
+            rt.BlendOp = blend_op(op);
+            rt.SrcBlendAlpha = blend_factor(asrc, true);
+            rt.DestBlendAlpha = blend_factor(adst, true);
+            rt.BlendOpAlpha = blend_op(aop);
+        }
+        let mode = r(0xa0);
+        g.rasterizer.CullMode = match mode & 3 {
+            1 => D3D12_CULL_MODE_FRONT,
+            2 => D3D12_CULL_MODE_BACK,
+            _ => D3D12_CULL_MODE_NONE,
+        };
+        // FACE 0: counter-clockwise is the front.
+        g.rasterizer.FrontCounterClockwise = (mode >> 2 & 1 == 0).into();
+        let depth = r(0xb8);
+        let func = |f: u32| D3D12_COMPARISON_FUNC((f & 7) as i32 + 1);
+        g.depth.DepthEnable = (depth >> 1 & 1 != 0).into();
+        g.depth.DepthWriteMask = if depth >> 2 & 1 != 0 { D3D12_DEPTH_WRITE_MASK_ALL } else { D3D12_DEPTH_WRITE_MASK_ZERO };
+        g.depth.DepthFunc = func(depth >> 4);
+        g.depth_bounds = depth >> 3 & 1 != 0;
+        g.depth.StencilEnable = (depth & 1 != 0).into();
+        let refmask = r(0xc0);
+        g.depth.StencilReadMask = (refmask >> 8) as u8;
+        g.depth.StencilWriteMask = (refmask >> 16) as u8;
+        let ops = r(0xc8);
+        let face = |f: u32, shift: u32| D3D12_DEPTH_STENCILOP_DESC {
+            StencilFailOp: stencil_op(ops >> shift & 0xF),
+            StencilPassOp: stencil_op(ops >> (shift + 4) & 0xF),
+            StencilDepthFailOp: stencil_op(ops >> (shift + 8) & 0xF),
+            StencilFunc: func(f),
+        };
+        g.depth.FrontFace = face(depth >> 8, 0);
+        g.depth.BackFace = if depth >> 7 & 1 != 0 { face(depth >> 20, 12) } else { g.depth.FrontFace };
+        g.names = (0..elements.len()).map(|_| c"ATTRIB".to_owned()).collect();
+        g.inputs = elements
+            .iter()
+            .zip(&g.names)
+            .map(|(e, name)| D3D12_INPUT_ELEMENT_DESC {
+                SemanticName: PCSTR(name.as_ptr().cast()),
+                SemanticIndex: e.index,
+                Format: DXGI_FORMAT(crate::resource::pc_format(e.format) as i32),
+                InputSlot: e.slot,
+                AlignedByteOffset: e.offset,
+                InputSlotClass: if e.instance {
+                    D3D12_INPUT_CLASSIFICATION_PER_INSTANCE_DATA
+                } else {
+                    D3D12_INPUT_CLASSIFICATION_PER_VERTEX_DATA
+                },
+                InstanceDataStepRate: u32::from(e.instance),
+            })
+            .collect();
+        g.topology = D3D12_PRIMITIVE_TOPOLOGY_TYPE(i32::from(t.topology.max(1)));
+        g.targets.NumRenderTargets = u32::from(t.count.min(8));
+        for n in 0..8 {
+            g.targets.RTFormats[n] = DXGI_FORMAT(t.formats[n]);
+        }
+        g.depth_format = DXGI_FORMAT(t.depth);
+        if g.depth_format == DXGI_FORMAT_UNKNOWN {
+            g.depth.DepthEnable = false.into();
+            g.depth.StencilEnable = false.into();
+            g.depth.DepthWriteMask = D3D12_DEPTH_WRITE_MASK_ZERO;
+        }
+        g.samples = DXGI_SAMPLE_DESC { Count: t.samples.max(1), Quality: 0 };
+        g
+    }
+}
+
+/// The depth view format for a depth texture's format (typeless ones have
+/// their depth form).
+pub(crate) fn depth_view_format(f: DXGI_FORMAT) -> DXGI_FORMAT {
+    match f {
+        DXGI_FORMAT_R32_TYPELESS | DXGI_FORMAT_R32_FLOAT => DXGI_FORMAT_D32_FLOAT,
+        DXGI_FORMAT_R16_TYPELESS | DXGI_FORMAT_R16_UNORM => DXGI_FORMAT_D16_UNORM,
+        DXGI_FORMAT_R24G8_TYPELESS | DXGI_FORMAT_R24_UNORM_X8_TYPELESS => DXGI_FORMAT_D24_UNORM_S8_UINT,
+        DXGI_FORMAT_R32G8X24_TYPELESS | DXGI_FORMAT_R32_FLOAT_X8X24_TYPELESS => DXGI_FORMAT_D32_FLOAT_S8X24_UINT,
+        f => f,
+    }
+}

@@ -495,6 +495,9 @@ pub(crate) struct State {
     /// whether a topology was set, the render target and depth handles, the
     /// viewports, the scissors, the blend factor and the stencil reference.
     topology_set: bool,
+    /// The bound targets and the topology type, for pipelines handed over in
+    /// pieces ([`crate::pipeline::host_pipeline_for`]).
+    piece_targets: crate::pipeline::host::Targets,
     target_handles: Vec<u64>,
     depth_handle: u64,
     targets_set: bool,
@@ -1162,6 +1165,13 @@ impl State {
     pub(crate) fn set_topology(&mut self, list: &HostList, topology: u32) {
         self.topology = topology;
         self.topology_set = true;
+        // D3D12_PRIMITIVE_TOPOLOGY_TYPE: point, line, triangle, patch.
+        self.piece_targets.topology = match topology {
+            1 => 1,
+            2 | 3 | 10 | 11 => 2,
+            33..=64 => 4,
+            _ => 3,
+        };
         let host = match topology {
             RECTANGLES => 4,
             TRIANGLE_FAN | LINE_LOOP | QUADS | QUAD_STRIP => {
@@ -1299,6 +1309,36 @@ impl State {
             crate::capture::note_target(record.resource);
             Some((texture, record))
         });
+        {
+            let t = &mut self.piece_targets;
+            t.formats = [0; 8];
+            t.count = views.len().min(8) as u8;
+            t.samples = 1;
+            for (n, (texture, desc)) in views.iter().take(8).enumerate() {
+                // SAFETY: the live host texture of this view.
+                let td = texture.map(|x| unsafe { x.GetDesc() });
+                if let Some(td) = &td {
+                    t.samples = td.SampleDesc.Count;
+                }
+                t.formats[n] = desc
+                    .as_ref()
+                    .map(|d| d.Format)
+                    .filter(|f| f.0 != 0)
+                    .or(td.map(|d| d.Format))
+                    .map_or(0, |f| f.0);
+            }
+            t.depth = dsv.as_ref().map_or(0, |(texture, record)| {
+                // SAFETY: as above.
+                let td = unsafe { texture.GetDesc() };
+                t.samples = td.SampleDesc.Count;
+                record
+                    .depth_desc()
+                    .map(|d| d.Format)
+                    .filter(|f| f.0 != 0)
+                    .unwrap_or(crate::pipeline::host::depth_view_format(td.Format))
+                    .0
+            });
+        }
         let now = (keys, dsv.as_ref().map(|(texture, record)| (texture.as_raw() as usize, record.key())));
         static CACHE: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
         if *CACHE.get_or_init(|| std::env::var("VICTORY_BIND_CACHE").map_or(true, |v| v != "0"))
@@ -1580,7 +1620,7 @@ impl State {
         if crate::pipeline::is_skipped(self.pipeline as This) {
             return prepare_failed!(self, SkippedPipeline);
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) else {
             return prepare_failed!(self, MissingHostPipeline);
         };
         if p.compute || p.mesh != mesh {
@@ -3223,7 +3263,7 @@ impl State {
             }
             return;
         }
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) else {
             once!(
                 pipeline = format_args!("{:#x}", self.pipeline),
                 "a dispatch without a host pipeline dropped"
@@ -3422,7 +3462,7 @@ impl State {
     #[cfg(feature = "diagnostics")]
     fn op_text(&self, kind: String, compute: bool) -> String {
         use std::fmt::Write;
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) else {
             return kind;
         };
         let mut text = format!("{kind} {}", p.name);
@@ -3506,7 +3546,7 @@ impl State {
         const GLOBAL: u32 = 688;
         const DRAW_CONSTANTS: u32 = 56;
         let wanted = list_slots();
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) else {
             return String::new();
         };
         let Some(stage) = p.stages.iter().find(|s| wanted.iter().any(|w| s.shader.hash.starts_with(w.as_str())))
@@ -3681,7 +3721,7 @@ impl State {
                     list.note_op(|| self.op_text(format!("mesh {x}"), false));
                     self.mesh_scissor(list, true);
                     #[cfg(feature = "diagnostics")]
-                    if let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) {
+                    if let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) {
                         list.ran_indirect(p.pso.as_raw() as usize, &p.name, crate::host::indirects::DIRECT, x, &self.user);
                     }
                     // (The host takes 65,535 groups in a dimension: more is
@@ -3693,7 +3733,7 @@ impl State {
                     unsafe { l6.DispatchMesh(x.min(65_535), 1, 1) };
                     self.drew(
                         list,
-                        crate::pipeline::host_pipeline(self.pipeline as This),
+                        crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets),
                         #[cfg(feature = "diagnostics")]
                         "DispatchMesh",
                     );
@@ -4129,7 +4169,7 @@ impl State {
     /// builds).
     #[cfg(feature = "diagnostics")]
     fn reads(&self, compute: bool) -> Vec<String> {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) else {
             return vec!["no host pipeline".into()];
         };
         let mut out = Vec::new();
@@ -4184,7 +4224,7 @@ impl State {
             };
             self.drew(
                 list,
-                crate::pipeline::host_pipeline(self.pipeline as This),
+                crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets),
                 #[cfg(feature = "diagnostics")]
                 "DrawInstanced",
             );
@@ -4200,13 +4240,13 @@ impl State {
     /// Whether the bound pipeline completes rectangles itself, in the
     /// geometry stage rectangle pipelines get (`HostPipeline::rects`).
     fn completes_rects(&self) -> bool {
-        crate::pipeline::host_pipeline(self.pipeline as This).is_some_and(|p| p.rects)
+        crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets).is_some_and(|p| p.rects)
     }
 
     /// Binds vertex buffers holding the rectangles of vertices `first..first
     /// + count` as triangles, made when the list is submitted.
     fn rectangles(&self, list: &HostList, count: u32, first: u32) -> bool {
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) else {
             return false;
         };
         let rects = u64::from(count / 3);
@@ -4294,7 +4334,7 @@ impl State {
             };
             self.drew(
                 list,
-                crate::pipeline::host_pipeline(self.pipeline as This),
+                crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets),
                 #[cfg(feature = "diagnostics")]
                 "DrawIndexedInstanced",
             );
@@ -4429,7 +4469,7 @@ impl State {
         let why = |what: &str| crate::pipeline::note_why(format!("indirect kind {kind}: {what}"));
         #[cfg(not(feature = "diagnostics"))]
         let why = |_: &str| {};
-        let Some(p) = crate::pipeline::host_pipeline(self.pipeline as This) else {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) else {
             #[cfg(feature = "diagnostics")]
             crate::pipeline::note_drop(self.pipeline as This);
             return false;

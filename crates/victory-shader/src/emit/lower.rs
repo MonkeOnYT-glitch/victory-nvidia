@@ -13005,7 +13005,12 @@ impl<'a> Lower<'a> {
             .exports
             .get(&(b, i))
             .ok_or("an export I/O raising did not see")?;
-        if e.compressed {
+        // A compressed color export carries two 16-bit channels per VGPR
+        // (channel c in half c & 1 of the VGPR for c / 2): the f16 form,
+        // `SPI_SHADER_COL_FORMAT` FP16_ABGR, which is all the programs the
+        // title hands over in pieces export (device method 0x1c8).
+        // shortcut: the UNORM16, SNORM16, UINT16 and SINT16 forms read as f16.
+        if e.compressed && !matches!(e.target, Target::Color(_)) {
             return Err("a compressed export");
         }
         let guard = self.guard(b, i)?;
@@ -13079,11 +13084,21 @@ impl<'a> Lower<'a> {
                 }
             }
         }
+        if e.compressed
+            && let Target::Color(n) = e.target
+            && let Some(id) = outputs.iter().position(|o| o.kind == 16 && o.row == Some(u32::from(n)))
+        {
+            for ch in 0..4u8 {
+                if let Some(value) = e.values[usize::from(ch)] {
+                    stores.push((id, ch, value, Some(ch & 1 == 1)));
+                }
+            }
+        }
         for ch in 0..4u8 {
             let Some(value) = e.values[usize::from(ch)] else {
                 continue;
             };
-            if halves.is_some() {
+            if halves.is_some() || e.compressed {
                 break;
             }
             let found = match e.target {

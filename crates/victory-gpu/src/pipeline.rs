@@ -20,7 +20,7 @@ use std::collections::HashMap;
 use std::mem::offset_of;
 use std::sync::{Arc, Mutex, OnceLock};
 
-use crate::object::{self, E_INVALIDARG, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
+use crate::object::{self, E_INVALIDARG, E_NOTIMPL, HRESULT, Iid, Object, PIPELINE, Table, This, guid};
 use crate::resource::PAGEABLE_IIDS;
 
 const PIPELINE_IIDS: [Iid; 4] = [
@@ -526,6 +526,10 @@ struct Pipeline {
     /// ([`for_rays`]).
     #[cfg(windows)]
     rt_only: RayOnly,
+    /// Handed over in pieces (device method 0x1c8): host pipelines made per
+    /// the targets of the draws ([`host_pipeline_for`]).
+    #[cfg(windows)]
+    pieces: Option<Box<Pieces>>,
 }
 const _: () = assert!(offset_of!(Pipeline, packet) == 0x10);
 
@@ -757,6 +761,24 @@ fn hand_out(
     iid: *const Iid,
     out: *mut This,
 ) -> HRESULT {
+    hand_out_with(
+        shaders,
+        #[cfg(windows)]
+        graphics,
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+fn hand_out_with(
+    shaders: Vec<Arc<Shader>>,
+    #[cfg(windows)] graphics: Option<Box<host::GraphicsState>>,
+    #[cfg(windows)] pieces: Option<Box<Pieces>>,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
     tracing::trace!(?shaders, "pipeline state");
     #[cfg(windows)]
     let host = Arc::new(make::Pending::new(shaders.clone(), graphics));
@@ -784,6 +806,8 @@ fn hand_out(
         rt_only: shaders.iter().filter(|s| s.stage == "compute").map(|s| for_rays(&s.container)).find(|k| *k != RayOnly::No).unwrap_or(RayOnly::No),
         shaders,
         bound: std::sync::atomic::AtomicBool::new(false),
+        #[cfg(windows)]
+        pieces,
     });
     object::hand_out(PIPELINE, pipeline, iid, &PIPELINE_IIDS, out)
 }
@@ -843,6 +867,220 @@ pub(crate) extern "system" fn create_compute_x(
     out: *mut This,
 ) -> HRESULT {
     create_compute(this, desc, iid, out)
+}
+
+/// Device method 0x218: a compute pipeline from the console compiler's
+/// pieces. The description (one of an array the title steps through, 0x60
+/// bytes each) is a root signature, then (address, size) pairs: the
+/// pipeline registers (0x1c bytes, `FSPX` kind 0), the pipeline hash (0x14,
+/// kind 1), the code (in GPU memory, padded to 0x40 bytes), the program
+/// metadata (kind 7); then two addresses and a 64-bit hash not read. They
+/// become an `ACCC` container ([`victory_shader::native::compute_container`])
+/// and go the way of [`create_compute`]. Pieces that do not read as a
+/// program leave the title without the pipeline, as before (`E_NOTIMPL`,
+/// `out` null). Off unless `VICTORY_PIECE_PIPELINES=1`: the title falls back to making
+/// the same pipeline from its shader containers when this fails (these are
+/// its pipeline cache), and the pieces translated so far broke the picture
+/// (runs pd5-pd10: a grey or wedged screen; off, the world as before).
+pub(crate) extern "system" fn create_compute_parts(
+    _: This,
+    desc: *const u64,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_PIPELINES").is_some_and(|v| v == "1"));
+    if !on {
+        if !out.is_null() {
+            // SAFETY: the title's out pointer.
+            unsafe { *out = std::ptr::null() };
+        }
+        return E_NOTIMPL;
+    }
+    let container = if !on {
+        Err("VICTORY_PIECE_PIPELINES=0".to_owned())
+    } else if desc.is_null() {
+        Err("no description".to_owned())
+    } else {
+        // SAFETY: the title passes a description of 12 words, and the
+        // pieces its pairs name.
+        let w = unsafe { std::slice::from_raw_parts(desc, 12) };
+        let piece = |i: usize| -> Result<&[u8], String> {
+            let (at, size) = (w[i] as *const u8, w[i + 1] as usize);
+            if at.is_null() || size == 0 || size > 1 << 20 {
+                return Err(format!("word {i}: piece {at:?} of {size:#x} bytes"));
+            }
+            // SAFETY: as above.
+            Ok(unsafe { std::slice::from_raw_parts(at, size) })
+        };
+        (|| victory_shader::native::compute_container(piece(1)?, piece(3)?, piece(5)?, piece(7)?))()
+    };
+    let container = match container {
+        Ok(c) => c,
+        Err(why) => {
+            if !out.is_null() {
+                // SAFETY: the title's out pointer.
+                unsafe { *out = std::ptr::null() };
+            }
+            static SEEN: std::sync::atomic::AtomicU32 = std::sync::atomic::AtomicU32::new(0);
+            let n = SEEN.fetch_add(1, std::sync::atomic::Ordering::Relaxed) + 1;
+            if n <= 16 || n.is_power_of_two() {
+                // SAFETY: as above.
+                let words = (!desc.is_null()).then(|| unsafe { std::slice::from_raw_parts(desc, 12) });
+                tracing::warn!(n, why, words = format_args!("{words:x?}"), "a compute pipeline in pieces that do not read as a program: the title goes without it");
+            }
+            return E_NOTIMPL;
+        }
+    };
+    let cs = shader("compute", &container);
+    tracing::info!(shader = cs.hash.as_str(), "a compute pipeline in pieces");
+    hand_out(
+        vec![cs],
+        #[cfg(windows)]
+        None,
+        iid,
+        out,
+    )
+}
+
+/// A graphics pipeline handed over in pieces: what its host pipelines are
+/// made from, and those made so far, one per bound targets (never removed
+/// while the pipeline lives).
+#[cfg(windows)]
+pub(crate) struct Pieces {
+    regs: Vec<u8>,
+    elements: Vec<victory_shader::pieces::VertexElement>,
+    variants: Mutex<Vec<(host::Targets, Arc<make::Pending>)>>,
+}
+
+/// Device method 0x1c8: a graphics pipeline from the console compiler's
+/// pieces ([`victory_shader::pieces`]: the description, the programs and
+/// how they become containers). The host pipeline is made per the targets
+/// of the draws ([`host_pipeline_for`]): the pieces name no formats.
+/// Pieces that do not read as programs leave the title without the
+/// pipeline, as before. Off unless `VICTORY_PIECE_PIPELINES=1`: the title falls back to making
+/// the same pipeline from its shader containers when this fails (these are
+/// its pipeline cache), and the pieces translated so far broke the picture
+/// (runs pd5-pd10: a grey or wedged screen; off, the world as before).
+pub(crate) extern "system" fn create_graphics_parts(
+    _: This,
+    desc: *const u64,
+    iid: *const Iid,
+    out: *mut This,
+) -> HRESULT {
+    static ON: OnceLock<bool> = OnceLock::new();
+    let on = *ON.get_or_init(|| std::env::var_os("VICTORY_PIECE_PIPELINES").is_some_and(|v| v == "1"));
+    if !on {
+        if !out.is_null() {
+            // SAFETY: the title's out pointer.
+            unsafe { *out = std::ptr::null() };
+        }
+        return E_NOTIMPL;
+    }
+    static GRAPHICS: OnceLock<bool> = OnceLock::new();
+    let on = on && *GRAPHICS.get_or_init(|| std::env::var_os("VICTORY_PIECE_GRAPHICS").is_none_or(|v| v != "0"));
+    let made = if !on {
+        Err("VICTORY_PIECE_PIPELINES=0".to_owned())
+    } else if desc.is_null() {
+        Err("no description".to_owned())
+    } else {
+        // SAFETY: the title passes a description of 13 words, and the
+        // pieces its pairs name.
+        let w = unsafe { std::slice::from_raw_parts(desc, 13) };
+        let piece = |i: usize| -> Option<&[u8]> {
+            let (at, size) = (w[i] as *const u8, w[i + 1] as usize);
+            // SAFETY: as above.
+            (!at.is_null() && size > 0 && size <= 1 << 20).then(|| unsafe { std::slice::from_raw_parts(at, size) })
+        };
+        (|| {
+            let regs = piece(1).ok_or("no registers")?;
+            let vs = (piece(9).ok_or("no vertex program")?, piece(11).ok_or("no vertex metadata")?);
+            let ps = piece(5).zip(piece(7));
+            victory_shader::pieces::graphics(regs, piece(3).unwrap_or(&[]), vs, ps).map(|g| (regs.to_vec(), g))
+        })()
+        .map_err(|e: String| e)
+    };
+    let (regs, g) = match made {
+        Ok(m) => m,
+        Err(why) => {
+            if !out.is_null() {
+                // SAFETY: the title's out pointer.
+                unsafe { *out = std::ptr::null() };
+            }
+            // Counted by kind (the reason up to its first ':'); the first
+            // of each kind kept with VICTORY_PIPE_DUMP.
+            static KINDS: Mutex<Vec<(String, u32)>> = Mutex::new(Vec::new());
+            let kind: String = why.split(':').next().unwrap_or("").chars().take(60).collect();
+            let (k, n, total) = {
+                let mut kinds = KINDS.lock().unwrap_or_else(|e| e.into_inner());
+                let k = match kinds.iter().position(|(x, _)| *x == kind) {
+                    Some(k) => k,
+                    None => {
+                        kinds.push((kind.clone(), 0));
+                        kinds.len() - 1
+                    }
+                };
+                kinds[k].1 += 1;
+                (k, kinds[k].1, kinds.iter().map(|x| x.1).sum::<u32>())
+            };
+            if n <= 6 {
+                #[cfg(windows)]
+                crate::device::dump_pieces(&format!("1c8-refused{k}-{n}"), desc.cast());
+            }
+            if n <= 4 || total.is_power_of_two() {
+                let kinds = KINDS.lock().unwrap_or_else(|e| e.into_inner()).clone();
+                tracing::warn!(n, total, why, kinds = format_args!("{kinds:?}"), "a graphics pipeline in pieces that do not read as programs: the title goes without it");
+            }
+            return E_NOTIMPL;
+        }
+    };
+    let mut shaders = vec![shader("vertex", &g.vertex)];
+    shaders.extend(g.pixel.as_deref().map(|p| shader("pixel", p)));
+    tracing::info!(shaders = ?shaders.iter().map(|s| s.hash.as_str()).collect::<Vec<_>>(), elements = g.elements.len(), "a graphics pipeline in pieces");
+    #[cfg(windows)]
+    {
+        // The pipeline's own `host`: made for no targets, never drawn with;
+        // its first use starts the shaders' translation.
+        let template = host::GraphicsState::from_pieces(&regs, &g.elements, &host::Targets::default());
+        let pieces = Box::new(Pieces { regs, elements: g.elements, variants: Mutex::new(Vec::new()) });
+        hand_out_with(shaders, Some(Box::new(template)), Some(pieces), iid, out)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = regs;
+        hand_out(shaders, iid, out)
+    }
+}
+
+/// The host pipeline of `this` for a draw with targets `t`: for a pipeline
+/// handed over in pieces, the one made for those targets (queued at the
+/// first such draw, as any pipeline is at its first use); else
+/// [`host_pipeline`].
+#[cfg(windows)]
+pub(crate) fn host_pipeline_for<'a>(this: This, t: &host::Targets) -> Option<&'a host::HostPipeline> {
+    if this.is_null() {
+        return None;
+    }
+    let p = pipeline(this);
+    let Some(pieces) = &p.pieces else {
+        return make::ready(&p.host);
+    };
+    let pending = {
+        let mut v = pieces.variants.lock().unwrap_or_else(|e| e.into_inner());
+        match v.iter().find(|(k, _)| k == t) {
+            Some((_, made)) => made.clone(),
+            None => {
+                let g = host::GraphicsState::from_pieces(&pieces.regs, &pieces.elements, t);
+                let made = Arc::new(make::Pending::new(p.shaders.clone(), Some(Box::new(g))));
+                v.push((*t, made.clone()));
+                made
+            }
+        }
+    };
+    let made: *const host::HostPipeline = make::ready(&pending)?;
+    // SAFETY: the variant lives as long as the pipeline (variants are never
+    // removed), which the title keeps alive while it draws with it.
+    Some(unsafe { &*made })
 }
 
 /// A pipeline described as a stream: its size and the subobjects, each a

@@ -356,6 +356,7 @@ fn feature_levels(data: *mut c_void) -> HRESULT {
 /// methods can be written.
 /// shortcut: not implemented. Answering `S_OK` here without making the
 /// pipeline would hand the title whatever its stack held as an object.
+#[allow(dead_code)]
 extern "system" fn unknown_pipeline<const SLOT: usize>(
     _: This,
     desc: *const u8,
@@ -396,7 +397,52 @@ extern "system" fn unknown_pipeline<const SLOT: usize>(
             "a pipeline creation method that is not implemented: the title goes without this pipeline"
         );
     }
+    #[cfg(windows)]
+    if calls <= 8 || calls.is_power_of_two() {
+        dump_pieces(&format!("{SLOT:x}-{calls}"), desc);
+    }
     E_NOTIMPL
+}
+
+/// VICTORY_PIPE_DUMP=<folder>: a pipeline description in pieces (device
+/// methods 0x1c8 and 0x218) and every (address, size) pair after its first
+/// word, as files there named after `name`.
+#[cfg(windows)]
+pub(crate) fn dump_pieces(name: &str, desc: *const u8) {
+    {
+        if let Some(dir) = std::env::var_os("VICTORY_PIPE_DUMP") {
+            let dir = std::path::PathBuf::from(dir);
+            let _ = std::fs::create_dir_all(&dir);
+            let mut head = [0u8; 512];
+            if !desc.is_null() && crate::host::read_into(desc, &mut head) {
+                let _ = std::fs::write(dir.join(format!("{name}-desc.bin")), head);
+                let w: Vec<u64> = head
+                    .as_chunks::<8>().0.iter()
+                    .map(|c| u64::from_le_bytes(*c))
+                    .collect();
+                // The root signature object, and what words 34, 36 and 37
+                // of a graphics record point at.
+                for i in [0usize, 34, 36, 37] {
+                    let mut obj = [0u8; 0x200];
+                    if w[i] > 0x10000 && crate::host::read_into(w[i] as *const u8, &mut obj) {
+                        let _ = std::fs::write(dir.join(format!("{name}-word{i}.bin")), obj);
+                    }
+                }
+                for i in 1..w.len() - 1 {
+                    let (at, size) = (w[i], w[i + 1]);
+                    if at > 0x10000 && size > 0 && size <= 4 << 20 && at >> 48 == 0 {
+                        let mut blob = vec![0u8; size as usize];
+                        if crate::host::read_into(at as *const u8, &mut blob) {
+                            let _ = std::fs::write(
+                                dir.join(format!("{name}-w{i}-{at:x}-{size:x}.bin")),
+                                blob,
+                            );
+                        }
+                    }
+                }
+            }
+        }
+    }
 }
 
 /// The host device's state: the console's device is removed when the host's is
@@ -449,10 +495,10 @@ static FUNCTIONS: Table<160> = {
     f[39] = query::create as *const (); // 0x138
     f[41] = signature::create as *const (); // 0x148
     f[48] = queue::create_x as *const (); // 0x180
-    f[57] = unknown_pipeline::<0x1c8> as *const (); // 0x1c8
+    f[57] = pipeline::create_graphics_parts as *const (); // 0x1c8
     f[61] = descriptor::create_sampler_x as *const (); // 0x1e8
     f[62] = pipeline::create_compute_x as *const (); // 0x1f0
-    f[67] = unknown_pipeline::<0x218> as *const (); // 0x218
+    f[67] = pipeline::create_compute_parts as *const (); // 0x218
     f[69] = object::ignore as *const (); // 0x228 debug error filter
     f[70] = descriptor::create_placed_srv as *const (); // 0x230
     f[71] = descriptor::create_placed_uav as *const (); // 0x238

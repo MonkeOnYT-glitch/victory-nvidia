@@ -129,6 +129,9 @@ const FSPX_HEADER: usize = 0x10;
 const FSPX_PACKET: u32 = 0;
 const FSPX_CODE: u32 = 6;
 const FSPX_METADATA: u32 = 7;
+/// Ours: the stage I/O of a graphics program the title hands over in pieces
+/// ([`crate::pieces`]).
+pub(crate) const FSPX_STAGE_IO: u32 = 0x100;
 const PACKET_THREADS: usize = 0x0c;
 const PACKET_FLAGS: usize = 0x12;
 const PACKET_WAVE32: u16 = 1 << 4;
@@ -499,21 +502,44 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         Err(Malformed("FSPX entry missing"))
     };
-    let packet = entry(FSPX_PACKET)?;
     let code = entry(FSPX_CODE)?;
     let meta = entry(FSPX_METADATA)?;
     if u32_at(meta, 8)? as usize * 4 != code.len() {
         return Err(Malformed("FSPX code size disagrees"));
     }
+    let (layout, used) = fspx_resources(meta)?;
+    if let Ok(io) = entry(FSPX_STAGE_IO) {
+        return crate::pieces::graphics_program(io, code, layout, used);
+    }
+    let packet = entry(FSPX_PACKET)?;
     let wave64 = u16_at(packet, PACKET_FLAGS)? & PACKET_WAVE32 == 0;
     // VGPRs in granules of 4 (wave64) or 8 (wave32).
     let granules = (u32_at(packet, PACKET_RSRC1)? & 0x3F) + 1;
     let vgprs = (granules * if wave64 { 4 } else { 8 }).min(256) as u16;
     let threads = |i: usize| u16_at(packet, PACKET_THREADS + 2 * i).map(u32::from);
+    Ok(NativeProgram {
+        stage: HwStage::Cs,
+        wave64,
+        vgprs,
+        layout,
+        used,
+        io: StageIo::Cs(ComputeIo {
+            rsrc2: u32_at(packet, PACKET_RSRC2)?,
+            threads: [threads(0)?, threads(1)?, threads(2)?],
+        }),
+        code: code.to_vec(),
+    })
+}
+
+/// The root parameters and resources of program metadata (`FSPX` kind 7):
+/// records from +0x18 (version 0x403) or +0x10 (version 2, the graphics
+/// programs the title hands over in pieces).
+pub(crate) fn fspx_resources(meta: &[u8]) -> Result<(Vec<RootParam>, Vec<UsedResource>), ShaderError> {
+    let start = if u32_at(meta, 0)? == 2 { 0x10 } else { FSPX_RECORDS };
     let mut layout: Vec<RootParam> = Vec::new();
     let mut used = Vec::new();
     for e in meta
-        .get(FSPX_RECORDS..)
+        .get(start..)
         .unwrap_or(&[])
         .as_chunks::<FSPX_RECORD>()
         .0
@@ -546,6 +572,12 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
             RootType::Descriptor => 2,
             // The code holds its words; no user data.
             RootType::ImmediateSampler => 0,
+            // The 32-bit heap addresses (programs the title hands over in
+            // pieces, device method 0x218).
+            RootType::ResourceHeap | RootType::SamplerHeap => 1,
+            // shortcut: as many as the record's dword count says (seen in
+            // the pieces' programs; not yet checked against their code).
+            RootType::Constants => u32::from(e[20].max(1)),
             _ => return Err(Malformed("an FSPX resource of an unknown root type")),
         };
         if sgprs > 0 && !layout.iter().any(|p| p.slot == u.slot) {
@@ -560,18 +592,70 @@ pub fn fspx_program(part: &[u8]) -> Result<NativeProgram, ShaderError> {
         }
         used.push(u);
     }
-    Ok(NativeProgram {
-        stage: HwStage::Cs,
-        wave64,
-        vgprs,
-        layout,
-        used,
-        io: StageIo::Cs(ComputeIo {
-            rsrc2: u32_at(packet, PACKET_RSRC2)?,
-            threads: [threads(0)?, threads(1)?, threads(2)?],
-        }),
-        code: code.to_vec(),
-    })
+    Ok((layout, used))
+}
+
+/// An `FSPX` blob of `entries` (kind, bytes), as [`fspx_program`] reads it;
+/// each entry padded to 4 bytes.
+pub fn fspx_blob(entries: &[(u32, &[u8])]) -> Vec<u8> {
+    let head = FSPX_HEADER + 16 * entries.len();
+    let total = head + entries.iter().map(|(_, d)| d.len().next_multiple_of(4)).sum::<usize>();
+    let mut out = Vec::with_capacity(total);
+    for v in [u32::from_le_bytes(*b"FSPX"), FSPX_VERSION, entries.len() as u32, total as u32] {
+        out.extend_from_slice(&v.to_le_bytes());
+    }
+    let mut at = head;
+    for (kind, d) in entries {
+        for v in [*kind, at as u32, d.len() as u32, 0] {
+            out.extend_from_slice(&v.to_le_bytes());
+        }
+        at += d.len().next_multiple_of(4);
+    }
+    for (_, d) in entries {
+        out.extend_from_slice(d);
+        out.resize(out.len().next_multiple_of(4), 0);
+    }
+    out
+}
+
+/// A container with an `ACCC` part for a compute program the title hands
+/// over in pieces (device method 0x218): the pipeline registers (`FSPX`
+/// kind 0, 0x1c bytes), the pipeline hash (kind 1), the code and the program
+/// metadata (kind 7, version 0x403). The code is cut to the length the
+/// metadata states (the title pads it to 0x40 bytes). `None` if the pieces
+/// do not read as one.
+pub fn compute_container(
+    regs: &[u8],
+    hash: &[u8],
+    code: &[u8],
+    meta: &[u8],
+) -> Result<Vec<u8>, String> {
+    if regs.len() < 0x1c {
+        return Err(format!("registers of {:#x} bytes", regs.len()));
+    }
+    let version = u32_at(meta, 0).map_err(|e| e.to_string())?;
+    if version != 0x403 {
+        return Err(format!("metadata version {version:#x}"));
+    }
+    let dwords = u32_at(meta, 8).map_err(|e| e.to_string())? as usize;
+    let code = code
+        .get(..dwords * 4)
+        .ok_or_else(|| format!("{dwords:#x} code dwords in {:#x} bytes", code.len()))?;
+    let blob = fspx_blob(&[
+        (FSPX_PACKET, regs),
+        (1, hash),
+        (FSPX_CODE, code),
+        (FSPX_METADATA, meta),
+    ]);
+    let p = fspx_program(&blob).map_err(|e| e.to_string())?;
+    // `VICTORY_PIECE_CONSTANTS=0`: programs with root constants refused (their
+    // user data is a guess, [`fspx_resources`]).
+    if p.layout.iter().any(|l| l.root == RootType::Constants)
+        && std::env::var_os("VICTORY_PIECE_CONSTANTS").is_some_and(|v| v == "0")
+    {
+        return Err("root constants (VICTORY_PIECE_CONSTANTS=0)".into());
+    }
+    Ok(crate::dxbc::build(&[(crate::FourCC::ACCC, &blob)]))
 }
 
 fn u16_at(data: &[u8], at: usize) -> Result<u16, ShaderError> {
