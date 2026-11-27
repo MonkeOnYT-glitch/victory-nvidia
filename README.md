@@ -53,6 +53,11 @@ What it adds:
   woken (256 upstream). With all of them there, the submitting thread's work fell
   from 71-85 to 61-63 ms a frame and the title's wait at presents from 39 to 29 ms;
   the cutscene's own swings (14-17 fps) hide the frame-rate change in one run.
+- **Our own tone mapping** (`VICTORY_TONEMAP=1`): the title's tone-mapping pass
+  turned a smooth, lit HDR picture into one with black shadows and contour bands
+  (target dumps). Replaced after its draw by exposure from the picture's mean
+  log luminance, the ACES fit and a dither: no banding, the walls, the frosted
+  window and the orange jumpsuit show; fps unchanged.
 - **Lighting without the structure builder**: `VICTORY_RT_MISS=1 VICTORY_RT_RESOLVE=1
   VICTORY_ACTIVATE_RAYS=1 VICTORY_RT_TRACE=1`. The ray-tracing resolve and probe
   passes were left out when no structures are built, and that left surfaces that
