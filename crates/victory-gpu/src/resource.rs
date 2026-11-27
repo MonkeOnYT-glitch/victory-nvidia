@@ -1599,7 +1599,7 @@ fn hosted(this: This, make: bool) -> Option<Made> {
             // levels are left out is made level by level too, whole or not:
             // the card then holds a quarter of it a level left out (an 8 GB
             // card left 5,000 textures, 4.7 GB, without a host copy: dark rooms).
-            let dropping = crate::texture::dropped_levels(bytes, usize::from(r.desc.mip_levels)) > 0;
+            let dropping = crate::texture::dropped_levels_at(start, bytes, usize::from(r.desc.mip_levels)) > 0;
             let partly = readable
                 && bytes >= crate::tiles::floor()
                 && (dropping
@@ -1637,6 +1637,13 @@ fn hosted(this: This, make: bool) -> Option<Made> {
                 base = 0;
                 prefill = Some(found);
             }
+        }
+        // A texture the card has no room for is made low only in tiles
+        // (`crate::texture::making_low`); one that cannot be made so waits for
+        // room, as all did before: made whole it took the card past its
+        // budget (vis3).
+        if tiled.is_none() && crate::texture::is_making_low() {
+            return None;
         }
         let texture = match texture {
             Some(texture) => Some(texture),
@@ -1757,6 +1764,29 @@ pub(crate) fn room(memory: Option<[u64; 4]>) -> bool {
                 < budget / 100 * room_percent()
         }
         None => filled < WITHOUT_BUDGET,
+    }
+}
+
+/// Whether the pass may still make textures at low resolution
+/// (`crate::texture::making_low`) while [`room`] says no: under one and a
+/// half times `VICTORY_TEXTURE_BUDGET_MB` (or with no such limit, while the
+/// card's memory in use is under 97 % of its budget).
+#[cfg(windows)]
+pub(crate) fn low_room(memory: Option<[u64; 4]>) -> bool {
+    use std::sync::atomic::Ordering::Relaxed;
+    if !crate::texture::low_wanted() {
+        return false;
+    }
+    let limit = std::env::var("VICTORY_TEXTURE_BUDGET_MB").ok().and_then(|mb| mb.trim().parse::<u64>().ok());
+    let filled = KINDS[1].load(Relaxed) + crate::tiles::given_total();
+    // And never past 98 % of the card's budget as the system counts it:
+    // 1.5 times a 1 GB limit alone took an 8 GB card to 6.6 GB of 6.3 (vis2,
+    // 1,361 low textures of up to 256 KiB a level; 4 fps while the system
+    // moved its memory). The card stood at 97 % without them (vis1).
+    let card = memory.is_some_and(|[budget, used, ..]| used < budget / 100 * 98);
+    card && match limit {
+        Some(mb) => filled < (mb << 20) / 2 * 3,
+        None => true,
     }
 }
 

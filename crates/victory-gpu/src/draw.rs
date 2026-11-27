@@ -826,6 +826,9 @@ pub(crate) static HEAP_TEXTURES_WAITING: AtomicU64 = AtomicU64::new(0);
 /// Passes that made no texture because the card had no room
 /// (`crate::resource::room`), for the memory line.
 pub(crate) static HEAP_TEXTURES_FULL: AtomicU64 = AtomicU64::new(0);
+/// Textures made low because the card had no room for them
+/// (`crate::texture::making_low`).
+pub(crate) static LOW_MADE: AtomicU64 = AtomicU64::new(0);
 
 /// Frames after a whole upload of a texture picked by index at which its
 /// memory is looked at again, each counted from the look before.
@@ -2693,6 +2696,9 @@ impl State {
         // returned here, and a slot whose texture had been streamed out
         // kept its host copy for as long as the card was full).
         let mut room = crate::resource::room(memory);
+        // Past the room, textures made low while this holds
+        // (`crate::resource::low_room`).
+        let mut low_room = !room && crate::resource::low_room(memory);
         // Bytes uploaded by this pass since the card was last asked
         // whether it has room: asked again every 32 MiB (a pass may upload
         // 192 MB and more, and one asking a pass let the queue run some
@@ -2816,6 +2822,7 @@ impl State {
 
         let began = std::time::Instant::now();
         for (index, write) in due {
+            crate::texture::making_low(false);
             if SPENT.load(Ordering::Relaxed) >= bytes_at_most || began.elapsed() > span {
                 served = false;
                 break;
@@ -2937,27 +2944,39 @@ impl State {
                 let has_its_texture = reupload_when_full()
                     && heap.handle(index).is_some_and(|handle| host.texture_slot_made_from(index, handle));
                 if !has_its_texture {
-                    refused += 1;
-                    if full_card_pass() {
-                        // Held back for the frames of about four seconds
-                        // (`most`), or until the card has room; the pass
-                        // goes on, within a count that bounds one pass.
-                        host.texture_slot_held(index, write, frame + most);
-                        if refused > 1024 {
+                    // Past the room, made low (its largest levels left out)
+                    // while there is room for that: a blurred surface, not a
+                    // black one (`crate::texture::making_low`).
+                    if low_room {
+                        crate::texture::making_low(true);
+                        let n = LOW_MADE.fetch_add(1, Ordering::Relaxed) + 1;
+                        if n == 1 || n.is_multiple_of(500) {
+                            tracing::info!(so_far = n, low = crate::texture::low_count(), "textures the card has no room for are made at low resolution");
+                        }
+                    } else {
+                        refused += 1;
+                        if full_card_pass() {
+                            // Held back for the frames of about four seconds
+                            // (`most`), or until the card has room; the pass
+                            // goes on, within a count that bounds one pass.
+                            host.texture_slot_held(index, write, frame + most);
+                            if refused > 1024 {
+                                break;
+                            }
+                        } else if refused > 256 {
                             break;
                         }
-                    } else if refused > 256 {
-                        break;
+                        continue;
                     }
-                    continue;
-                }
-                let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
-                if n == 1 || n.is_multiple_of(500) {
-                    tracing::info!(
-                        so_far = n,
-                        slot = index,
-                        "a texture already on the card is brought up to date although the card has no room for new ones"
-                    );
+                } else {
+                    let n = HEAP_TEXTURES_REUPLOADED_FULL.fetch_add(1, Ordering::Relaxed) + 1;
+                    if n == 1 || n.is_multiple_of(500) {
+                        tracing::info!(
+                            so_far = n,
+                            slot = index,
+                            "a texture already on the card is brought up to date although the card has no room for new ones"
+                        );
+                    }
                 }
             }
             // Gate new host texture creation / staging on commit reserve after
@@ -3185,9 +3204,11 @@ impl State {
             crate::texture::unstage(resource);
             SPENT.fetch_add(bytes, Ordering::Relaxed);
             since_asked += bytes;
-            if room && since_asked >= 32 << 20 {
+            if (room || low_room) && since_asked >= 32 << 20 {
                 since_asked = 0;
-                room = crate::resource::room(crate::host::host().and_then(|h| h.video_memory()));
+                let memory = crate::host::host().and_then(|h| h.video_memory());
+                room = crate::resource::room(memory);
+                low_room = !room && crate::resource::low_room(memory);
             }
             HEAP_TEXTURE_BYTES.fetch_add(bytes, Ordering::Relaxed);
             HEAP_TEXTURES.fetch_add(1, Ordering::Relaxed);

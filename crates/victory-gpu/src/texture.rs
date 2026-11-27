@@ -1323,7 +1323,7 @@ impl Staging {
         // slice or more, n + 3 levels or more) never holds its n largest
         // levels: no tiles, and views start below them (`show_from`). For an
         // 8 GB card: about three quarters less memory a level dropped.
-        let first = first.max(u64::from(dropped_levels(self.layout.slice_size, mips.len())));
+        let first = first.max(u64::from(dropped_levels_at(self.memory as u64, self.layout.slice_size, mips.len())));
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
         let there = |from: u64, to: u64| {
             to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
@@ -2565,4 +2565,68 @@ mod allocation_costs {
             timed("texture placed in 64 MB heaps", N, 8, &place);
         }
     }
+}
+
+/// Textures made at low resolution because the card had no room for them
+/// (`draw.rs`, the pass over textures picked by index): by the start of
+/// their title memory. Such a texture holds no level of over [`LOW_TOP`]
+/// bytes: a blurred wall in place of a black one. Off with
+/// `VICTORY_TEXTURE_LOW=0` (refused while the card has no room, as before).
+static LOW: std::sync::Mutex<Option<std::collections::HashSet<u64>>> = std::sync::Mutex::new(None);
+
+/// The largest level a low texture holds, in bytes.
+const LOW_TOP: u64 = 64 << 10;
+
+thread_local! {
+    /// Set by the texture pass while it makes a texture the card has no
+    /// room for: the texture made now is a low one.
+    static MAKING_LOW: std::cell::Cell<bool> = const { std::cell::Cell::new(false) };
+}
+
+/// Whether textures past the card's room are made low (on unless
+/// `VICTORY_TEXTURE_LOW=0`).
+pub(crate) fn low_wanted() -> bool {
+    static ON: std::sync::OnceLock<bool> = std::sync::OnceLock::new();
+    *ON.get_or_init(|| std::env::var_os("VICTORY_TEXTURE_LOW").is_none_or(|v| v != "0"))
+}
+
+/// The texture pass makes the next texture low (or not).
+pub(crate) fn making_low(on: bool) {
+    MAKING_LOW.with(|m| m.set(on));
+}
+
+/// Textures made low so far.
+pub(crate) fn low_count() -> usize {
+    LOW.lock().unwrap_or_else(|e| e.into_inner()).as_ref().map_or(0, |s| s.len())
+}
+
+/// Levels a low texture leaves out: as many as bring its largest level to
+/// [`LOW_TOP`] bytes or under, keeping one at least.
+fn low_drop(slice_size: u64, levels: usize) -> u32 {
+    let mut drop = 0u32;
+    while (slice_size >> (2 * drop)) > LOW_TOP && (drop as usize) + 1 < levels {
+        drop += 1;
+    }
+    drop
+}
+
+/// [`dropped_levels`] for the texture whose title memory starts at `start`:
+/// a low one's ([`LOW`]) leaves out more. Being made while the pass makes a
+/// low texture marks it low.
+pub(crate) fn dropped_levels_at(start: u64, slice_size: u64, levels: usize) -> u32 {
+    let plain = dropped_levels(slice_size, levels);
+    let making = MAKING_LOW.with(|m| m.get());
+    let mut low = LOW.lock().unwrap_or_else(|e| e.into_inner());
+    let is_low = if making {
+        low.get_or_insert_with(Default::default).insert(start);
+        true
+    } else {
+        low.as_ref().is_some_and(|s| s.contains(&start))
+    };
+    if is_low { plain.max(low_drop(slice_size, levels)) } else { plain }
+}
+
+/// Whether the texture being made now is a low one ([`making_low`]).
+pub(crate) fn is_making_low() -> bool {
+    MAKING_LOW.with(|m| m.get())
 }
