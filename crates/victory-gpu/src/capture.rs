@@ -154,7 +154,14 @@ pub(crate) fn wanted(n: u64) -> bool {
     let in_world = world_on() && first != u64::MAX && n > first && (n - first).is_multiple_of(8);
     // A file `want` in the folder: this frame too, once (a script asking for
     // what is on screen now).
-    let asked = folder().is_some_and(|f| std::fs::remove_file(f.join("want")).is_ok());
+    // (Asked again for the same frame, by the present that reads it back: the
+    // file is gone by then, the frame it was taken for is kept.)
+    static ASKED_FOR: std::sync::atomic::AtomicU64 = std::sync::atomic::AtomicU64::new(u64::MAX);
+    let asked = ASKED_FOR.load(std::sync::atomic::Ordering::Relaxed) == n
+        || folder().is_some_and(|f| std::fs::remove_file(f.join("want")).is_ok()) && {
+            ASKED_FOR.store(n, std::sync::atomic::Ordering::Relaxed);
+            true
+        };
     folder().is_some() && (n.is_power_of_two() || listed(n) || before_world || in_world || asked)
 }
 
