@@ -27,6 +27,8 @@
 //! - unset or `0`/`off`: the title's own output.
 //! - a number: that share of the estimate (1: all of it).
 //! - `constant:<level>`: the constant, as beloooo's fork has it.
+//! - `floor:<level>`: the title's own light, its garbage dropped, over a floor
+//!   of the scene's mean light times the level (one value for the picture).
 //!
 //! `VICTORY_AMBIENT_SHADE=<strength>,<radius in metres>` sets the creases.
 //!
@@ -81,11 +83,16 @@ enum Set {
     Off,
     Estimate(f32),
     Constant(f32),
+    /// The title's light over a floor of the scene's mean times the level.
+    Floor(f32),
 }
 
 fn parse(set: &str) -> Set {
     let set = set.trim();
     let number = |t: &str| t.trim().parse::<f32>().ok().filter(|v| v.is_finite() && *v > 0.0);
+    if let Some(level) = set.strip_prefix("floor:") {
+        return number(level).map_or(Set::Off, Set::Floor);
+    }
     match set.strip_prefix("constant:") {
         Some(level) => number(level).map_or(Set::Off, Set::Constant),
         None => number(set).map_or(Set::Off, Set::Estimate),
@@ -420,6 +427,24 @@ void raise(uint3 at : SV_DispatchThreadID) {
         }
         open = saturate(1.0 - strength * 2.0 * sum / N);
     }
+    // `floor:<level>`: the title's own light where it has some (the sky's
+    // outdoors), its garbage dropped, and under it
+    // a floor of a warm white times the level, shaded in creases (as
+    // beloooo's constant, which does not go with the exposure either). One
+    // value for the picture: nothing to glow near a bright window, nothing to
+    // band. Not the scene's mean: that holds the floor of the frame before,
+    // and the light it fed back changed every frame (12-13 fps against 19,
+    // the submitting thread 78 ms a frame against 50: run pdr9).
+    if (constant < 0.0) {
+        float3 under = float3(1.0, 0.98, 0.94) * level * open;
+        float3 was = unpack(light[p]);
+        if (was.g < 0.5 * min(was.r, was.b) && max(was.r, was.b) > 0.02) was = 0.0;
+        if (was.b > 2.5 * was.g && was.b > was.r && was.b > 0.02) was = 0.0;
+        // (Not bounded: the bound held the sky's light outdoors down, a darker
+        // yard than with no stand-in at all; run amb3.)
+        light[p] = pack(max(was, under));
+        return;
+    }
     float3 found;
     if (constant > 0.0) {
         found = float3(1.0, 0.98, 0.94) * constant * open;
@@ -598,11 +623,13 @@ pub(crate) fn after(list: &HostList, role: Role, views: &Views) -> bool {
         Set::Off => return false,
         Set::Estimate(level) => (level, 0.0f32),
         Set::Constant(level) => (0.0, level),
+        // (A negative constant tells the shader.)
+        Set::Floor(level) => (level, -1.0),
     };
     if role != Role::Radiance && constant == 0.0 && !KEPT.load(Ordering::Relaxed) {
         return false;
     }
-    if role == Role::Air && (constant > 0.0 || air() == 0.0) {
+    if role == Role::Air && (constant != 0.0 || air() == 0.0) {
         return false;
     }
     static SAID: Mutex<u32> = Mutex::new(0);
@@ -682,6 +709,7 @@ mod tests {
         assert_eq!(parse("0.8"), Set::Estimate(0.8));
         assert_eq!(parse("constant:0.3"), Set::Constant(0.3));
         assert_eq!(parse("constant:nan"), Set::Off);
+        assert_eq!(parse("floor:0.5"), Set::Floor(0.5));
     }
 
     #[test]
