@@ -1271,7 +1271,7 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
 /// The largest levels a texture of `slice_size` bytes a slice and `levels`
 /// levels goes without (`VICTORY_TEXTURE_DROP_LEVELS`, 0-3; with levels on
 /// demand only, where views start at the first level held).
-fn dropped_levels(slice_size: u64, levels: usize) -> u32 {
+pub(crate) fn dropped_levels(slice_size: u64, levels: usize) -> u32 {
     static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
     let drop = *DROP.get_or_init(|| {
         let n = std::env::var("VICTORY_TEXTURE_DROP_LEVELS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(3);
