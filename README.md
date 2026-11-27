@@ -16,6 +16,48 @@ developer or publisher.
 >
 > Ten captures from an earlier Series S playtest, on build `672cf831`.
 
+## This branch: an 8 GB NVIDIA card
+
+Branch `vice-tay-nvidia-8gb` is upstream Vice-Tay plus changes for a smaller
+PC: an RTX 5060 Ti 8 GB, a Ryzen 5 7600X (6 cores) and 31 GB of RAM, on the
+Series S profile. Measured in the prison yard (opening cutscene), diagnostics
+build:
+
+| Setup | fps | Notes |
+|---|---:|---|
+| Upstream `-Machine 4070` profile | 4.2 | card 470 MB over its 6.3 GB budget, 5.2 GB read from the PC's memory |
+| + the 8 GB settings below | 16.5 | picture unchanged |
+| + `-RayTracing` (with the watchdog fix) | 13.3-14.0 | ray-traced indirect light; colour banding on walls |
+
+What it adds:
+
+- **8 GB settings** (passed as environment variables): `VICTORY_LEVELS_ON_DEMAND=1`,
+  `VICTORY_TEXTURE_BUDGET_MB=1024`, `VICTORY_CARD_BUFFERS_MB=1536`,
+  `VICTORY_CARD_WINDOWS_MB=1024` with the 4070 profile's worker counts.
+  Capping the copies of textures picked by index frees room for card copies
+  of the title's buffers, which shaders otherwise read over PCIe. Each change
+  alone did nothing; together, 4.2 -> 16.5 fps. A 512 MB texture cap frees
+  600-850 MB more but leaves textures missing (clothes render black).
+- **The title's hang watchdog no longer ends a run.** A slow first world load
+  (ray tracing on, an 8 GB card) outlasted it, and it wrote to address 0.
+  `VICTORY_TITLE_WATCHDOG=1` keeps it.
+- **`VICTORY_WINDOW_AT=<x>,<y>`**: the title's window and the presenter's open
+  there (a virtual monitor), never full screen and never taking focus, so a run
+  can be stepped with `VICTORY_KEYS_FILE` while the desktop is in use.
+- **`VICTORY_CAPTURE`**: a file named `want` in the folder saves the next frame
+  (it was read twice per present, and the second read missed it).
+- **`VICTORY_REFRESH_FEW=<n>`**: how many of a submission's refreshes are checked
+  for "nothing new" on the submitting thread before the threads beside are
+  woken (256 upstream). With all of them there, the submitting thread's work fell
+  from 71-85 to 61-63 ms a frame and the title's wait at presents from 39 to 29 ms;
+  the cutscene's own swings (14-17 fps) hide the frame-rate change in one run.
+- **`VICTORY_TEXTURE_DROP_LEVELS=<n>`**: textures with levels on demand go without
+  their n largest levels. None in the prison yard qualified, so it had no effect there.
+
+Tried and not kept: `VICTORY_SEND_CHANGED=1` (copies slower: 15 against 16.5 fps),
+`VICTORY_SYNC_FINE=1` (no change), `VICTORY_BVH_SIZES_WAIT=1` (late structure
+sizes mostly fixed, banding unchanged, 15 % slower).
+
 ## At a glance
 
 - **It plays.** On the Series S profile the prologue runs from the prison
