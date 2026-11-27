@@ -29,6 +29,7 @@ build:
 | + the 8 GB settings below | 16.5 | picture unchanged |
 | + `-RayTracing` (with the watchdog fix) | 13.3-14.0 | ray-traced indirect light; colour banding on walls |
 | Release build, ray tracing off, `VICTORY_WINDOW_KB=1024` | 17.3-18.3 | release instead of diagnostics: +1-2 fps; the 1 MiB window grid: same fps, 0.5 GB less RAM |
+| + ports from trustno1-coder/VIctory-NVIDIA (below) | 18.6-19.5 | the submitting thread's helpers at its priority; picture unchanged |
 
 What it adds:
 
@@ -52,6 +53,15 @@ What it adds:
   woken (256 upstream). With all of them there, the submitting thread's work fell
   from 71-85 to 61-63 ms a frame and the title's wait at presents from 39 to 29 ms;
   the cutscene's own swings (14-17 fps) hide the frame-rate change in one run.
+- **Ported from [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**
+  (their authors kept): the submitting thread's helpers run at its priority
+  (Indy2l, +1 fps here); violet probe leftovers dropped before the ambient
+  raise (Ahyildiz, the purple blotch); `VICTORY_SKIP_BINK=1` skips the intro
+  movies (C-GDev via CuteBooty: the world 3:00 after launch instead of 5:28);
+  raw buffer views kept inside their buffer (lichenlang89 via CuteBooty,
+  `VICTORY_RAW_VIEW_CLAMP=0` restores). Their DLSS and frame generation come
+  with another renderer (CGBJ's) and are not ported; the BC7 and descriptor
+  slot fixes were here already.
 - **`VICTORY_WINDOW_KB=1024`** (an upstream option, measured here): copies of title
   memory outside buffers on a 1 MiB grid instead of 4 MiB. Same fps, 0.5 GB less
   private memory, and the PC's free memory 0.9 -> 1.8 GB in the prison yard.
