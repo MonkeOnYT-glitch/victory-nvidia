@@ -28,6 +28,7 @@ build:
 | Upstream `-Machine 4070` profile | 4.2 | card 470 MB over its 6.3 GB budget, 5.2 GB read from the PC's memory |
 | + the 8 GB settings below | 16.5 | picture unchanged |
 | + `-RayTracing` (with the watchdog fix) | 13.3-14.0 | ray-traced indirect light; colour banding on walls |
+| Release build, ray tracing off, `VICTORY_WINDOW_KB=1024` | 17.3-18.3 | release instead of diagnostics: +1-2 fps; the 1 MiB window grid: same fps, 0.5 GB less RAM |
 
 What it adds:
 
@@ -51,6 +52,16 @@ What it adds:
   woken (256 upstream). With all of them there, the submitting thread's work fell
   from 71-85 to 61-63 ms a frame and the title's wait at presents from 39 to 29 ms;
   the cutscene's own swings (14-17 fps) hide the frame-rate change in one run.
+- **`VICTORY_WINDOW_KB=1024`** (an upstream option, measured here): copies of title
+  memory outside buffers on a 1 MiB grid instead of 4 MiB. Same fps, 0.5 GB less
+  private memory, and the PC's free memory 0.9 -> 1.8 GB in the prison yard.
+  256 KiB fell to 4.4 fps; `VICTORY_WINDOW_TAILS=1` to 3.0 fps.
+- **Pipelines from the title's pipeline cache** (device methods 0x1c8, 0x218;
+  `VICTORY_PIECE_PIPELINES=1`, off by default): every fork leaves them
+  unimplemented, and the title then makes the same pipelines from its shader
+  containers, so nothing is missing. Implemented here (pieces decoded, vertex
+  fetches turned into input layouts, host pipelines per bound targets) but the
+  picture broke with them on, so they stay off.
 - **`VICTORY_TEXTURE_DROP_LEVELS=<n>`**: textures with levels on demand go without
   their n largest levels. None in the prison yard qualified, so it had no effect there.
 
