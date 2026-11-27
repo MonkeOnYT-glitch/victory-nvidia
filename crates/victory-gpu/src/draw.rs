@@ -1811,7 +1811,10 @@ impl State {
                 once!("a draw whose descriptor table found no free slots is dropped");
                 return prepare_failed!(self, DynamicDescriptorTable);
             }
-            if stage.shader.ambient.is_some() || stage.shader.probe.is_some() {
+            if stage.shader.ambient.is_some()
+                || stage.shader.probe.is_some()
+                || (crate::tonemap::on() && stage.shader.stage == "pixel" && crate::tonemap::is_tonemap(&stage.shader.hash))
+            {
                 self.ambient_tables.clear();
                 self.ambient_tables.extend(made.iter().copied());
             }
@@ -4250,12 +4253,42 @@ impl State {
                 "DrawInstanced",
             );
             DRAWN.fetch_add(1, Ordering::Relaxed);
+            if crate::tonemap::on() && self.tonemap(list) {
+                self.replay(list);
+            }
         }
         if !ran {
             DROPPED.fetch_add(1, Ordering::Relaxed);
             #[cfg(feature = "diagnostics")]
             dropped(self.pipeline);
         }
+    }
+
+    /// Our tone mapping after the title's (`crate::tonemap`), when the
+    /// bound pipeline's pixel program is the title's tone mapping. Whether it
+    /// recorded anything (the title's state is then to be set again).
+    fn tonemap(&mut self, list: &HostList) -> bool {
+        let Some(p) = crate::pipeline::host_pipeline_for(self.pipeline as This, &self.piece_targets) else {
+            return false;
+        };
+        let Some(stage) = p.stages.iter().find(|s| s.shader.stage == "pixel" && crate::tonemap::is_tonemap(&s.shader.hash)) else {
+            return false;
+        };
+        let Some(t) = stage.shader.translated() else {
+            return false;
+        };
+        let Some(hdr) = self.table_handle(t, false, ResourceType::Srv, crate::tonemap::HDR) else {
+            once!("our tone mapping: the HDR picture is not where it was");
+            return false;
+        };
+        let Some(v) = self.viewports.first() else {
+            return false;
+        };
+        let format = DXGI_FORMAT(self.piece_targets.formats[0]);
+        if self.piece_targets.count != 1 || format.0 == 0 {
+            return false;
+        }
+        crate::tonemap::after(list, format, [v.Width as u32, v.Height as u32], hdr)
     }
 
     /// Whether the bound pipeline completes rectangles itself, in the

@@ -37,6 +37,8 @@ mod cores;
 pub mod descriptor;
 pub mod device;
 #[cfg(windows)]
+mod tonemap;
+#[cfg(windows)]
 mod draw;
 pub mod dxgi;
 pub mod fence;

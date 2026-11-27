@@ -393,7 +393,10 @@ pub(crate) fn dump_targets(frame: u64) {
         let texture = &copy.texture;
         // SAFETY: a live resource.
         let d = unsafe { texture.GetDesc() };
-        if d.SampleDesc.Count > 1 || d.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D {
+        // 3D textures too (colour-grading tables): their slices stacked.
+        if d.SampleDesc.Count > 1
+            || !matches!(d.Dimension, D3D12_RESOURCE_DIMENSION_TEXTURE2D | D3D12_RESOURCE_DIMENSION_TEXTURE3D)
+        {
             continue;
         }
         // Every submission has run; the dump's list moves it there and back.
@@ -451,7 +454,9 @@ fn dump_one(
             return;
         }
         let pitch = f.RowPitch as usize;
-        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * f.Height as usize);
+        // A 3D texture's slices follow each other: one tall picture.
+        let tall = f.Height * f.Depth.max(1);
+        let rows = std::slice::from_raw_parts(data.cast::<u8>(), pitch * tall as usize);
         // A 24-bit depth plane comes back as 32-bit words: which depth values
         // (low 24 bits) and which top bytes it holds, the most common first.
         if matches!(d.Format.0, 44..=47) {
@@ -472,12 +477,24 @@ fn dump_one(
             };
             tracing::info!(?resource, depths = ?most(depths), top_bytes = ?most(tops), "24-bit depth plane values (value, texels)");
         }
-        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, f.Height as usize, pitch, rows) {
+        // Tiny half-float targets (exposure, luminance): their values as they are.
+        if f.Format.0 == 10 && (f.Width as usize) * (tall as usize) <= 64 {
+            let mut values = Vec::new();
+            for y in 0..tall as usize {
+                for x in 0..f.Width as usize {
+                    let at = y * pitch + x * 8;
+                    let h = |k: usize| half(u16::from_le_bytes([rows[at + 2 * k], rows[at + 2 * k + 1]]));
+                    values.push([h(0), h(1), h(2), h(3)]);
+                }
+            }
+            tracing::info!(?resource, width = f.Width, height = tall, ?values, "a small half-float target's values");
+        }
+        if let Some(rgba) = to_rgba(f.Format.0 as u32, f.Width as usize, tall as usize, pitch, rows) {
             let name = format!(
-                "frame-{frame}-{i:02}-{resource:?}-{}x{}-f{}",
-                d.Width, d.Height, d.Format.0
+                "frame-{frame}-{i:02}-{resource:?}-{}x{}x{}-f{}",
+                d.Width, d.Height, f.Depth.max(1), d.Format.0
             );
-            save_as(&name, f.Width, f.Height, f.Width as usize * 4, false, &rgba);
+            save_as(&name, f.Width, tall, f.Width as usize * 4, false, &rgba);
         } else {
             tracing::info!(format = f.Format.0, ?resource, "target not dumped: format");
         }
