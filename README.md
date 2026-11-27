@@ -53,6 +53,13 @@ What it adds:
   woken (256 upstream). With all of them there, the submitting thread's work fell
   from 71-85 to 61-63 ms a frame and the title's wait at presents from 39 to 29 ms;
   the cutscene's own swings (14-17 fps) hide the frame-rate change in one run.
+- **Textures the card has no room for are made at low resolution** (none of their
+  levels over 64 KiB) instead of being refused, which showed them black: walls,
+  the cell window, the yard and cloth. 23,621 such textures in the prison yard,
+  the card kept under 98 % of its budget, fps unchanged. `VICTORY_TEXTURE_LOW=0`
+  refuses them as before. With that, the indirect-light stand-in
+  (`VICTORY_AMBIENT`) only darkened the outdoors and made hair glow: the
+  launcher here runs without it, and with `VICTORY_CARD_WINDOWS_MB=512`.
 - **Ported from [trustno1-coder/VIctory-NVIDIA](https://github.com/trustno1-coder/VIctory-NVIDIA)**
   (their authors kept): the submitting thread's helpers run at its priority
   (Indy2l, +1 fps here); violet probe leftovers dropped before the ambient
