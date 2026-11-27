@@ -83,6 +83,7 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     if !loaded.info.is_dll() {
         // SAFETY: just mapped, and no title code has run.
         unsafe { crate::tls::redirect(loaded.base(), &loaded.info) }?;
+        hang_watchdog_off(loaded.base(), loaded.info.size_of_image as usize);
     }
     tracing::info!(
         base = format_args!("{:#x}", loaded.base()),
@@ -92,6 +93,51 @@ pub fn load(prepared: &PreparedImage, dir: &Path) -> Result<LoadedImage> {
     );
     crate::threads::mapped(&loaded);
     Ok(loaded)
+}
+
+/// The title's hang watchdog (Series build 1.0.2.1): a monitored thread silent
+/// too long (`jae` at RVA 0x2215bdc) or the main loop's heartbeat unchanged for
+/// 30 checks (`je` at RVA 0x2215c70) ends the run with a write to address 0.
+/// A first world load on a slow host (ray tracing on, an 8 GB card) outlasts
+/// both; both jumps become NOPs (each only when its bytes match).
+/// `VICTORY_TITLE_WATCHDOG=1` leaves the watchdog alone.
+fn hang_watchdog_off(base: usize, size: usize) {
+    const SITES: [(usize, &[u8], usize); 2] = [
+        (0x2215bd8, &[0xc5, 0x78, 0x2e, 0xc7, 0x73, 0x2e], 4),
+        (0x2215c6e, &[0xff, 0xcd, 0x74, 0x04, 0x89, 0xeb], 2),
+    ];
+    if std::env::var_os("VICTORY_TITLE_WATCHDOG").is_some_and(|v| v == "1") {
+        return;
+    }
+    use windows_sys::Win32::System::Memory::{PAGE_EXECUTE_READWRITE, VirtualProtect};
+    let mut patched = 0;
+    for (rva, expected, jump) in SITES {
+        if rva + expected.len() > size {
+            continue;
+        }
+        let at = (base + rva) as *mut u8;
+        // SAFETY: inside the image just mapped; no title code runs yet.
+        if unsafe { std::slice::from_raw_parts(at, expected.len()) } != expected {
+            continue;
+        }
+        // SAFETY: two bytes of the image's code, made writable and put back.
+        unsafe {
+            let jump = at.add(jump);
+            let mut old = 0;
+            if VirtualProtect(jump.cast(), 2, PAGE_EXECUTE_READWRITE, &mut old) == 0 {
+                continue;
+            }
+            jump.write(0x90);
+            jump.add(1).write(0x90);
+            VirtualProtect(jump.cast(), 2, old, &mut old);
+        }
+        patched += 1;
+    }
+    if patched == SITES.len() {
+        tracing::info!("title hang watchdog: both checks no longer end the run");
+    } else {
+        tracing::warn!(patched, of = SITES.len(), "title hang watchdog: not every check found to patch");
+    }
 }
 
 /// Maps the DLLs the title ships in `title_dir` that `main` imports,

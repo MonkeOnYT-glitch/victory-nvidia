@@ -1218,6 +1218,21 @@ pub(crate) fn card_writes(list: &HostList, resource: This, texture: &ID3D12Resou
     });
 }
 
+/// The largest levels a texture of `slice_size` bytes a slice and `levels`
+/// levels goes without (`VICTORY_TEXTURE_DROP_LEVELS`, 0-3; with levels on
+/// demand only, where views start at the first level held).
+fn dropped_levels(slice_size: u64, levels: usize) -> u32 {
+    static DROP: std::sync::OnceLock<u32> = std::sync::OnceLock::new();
+    let drop = *DROP.get_or_init(|| {
+        let n = std::env::var("VICTORY_TEXTURE_DROP_LEVELS").ok().and_then(|v| v.trim().parse::<u32>().ok()).unwrap_or(0).min(3);
+        if n > 0 {
+            tracing::info!(levels = n, "large textures go without their largest levels (VICTORY_TEXTURE_DROP_LEVELS)");
+        }
+        n
+    });
+    if drop > 0 && slice_size >= 1 << 20 && levels >= drop as usize + 3 { drop } else { 0 }
+}
+
 impl Staging {
     /// Levels on demand: what says, beside the mapping, which levels of
     /// the texture are the title's now. First the lowest level a live view
@@ -1254,6 +1269,11 @@ impl Staging {
         if self.layout.slices != 1 || mips.is_empty() || mips.len() > 32 {
             return u32::MAX;
         }
+        // `VICTORY_TEXTURE_DROP_LEVELS=<n>` (0-3): a large texture (1 MiB a
+        // slice or more, n + 3 levels or more) never holds its n largest
+        // levels: no tiles, and views start below them (`show_from`). For an
+        // 8 GB card: about three quarters less memory a level dropped.
+        let first = first.max(u64::from(dropped_levels(self.layout.slice_size, mips.len())));
         let tail = (self.layout.first_tail_mip as usize).min(mips.len());
         let there = |from: u64, to: u64| {
             to > from && to <= limit && committed(self.memory.wrapping_add(from as usize), (to - from) as usize)
