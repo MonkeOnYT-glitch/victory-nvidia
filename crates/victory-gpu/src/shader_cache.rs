@@ -139,6 +139,9 @@ fn build() -> [u8; 32] {
         if std::env::var_os("VICTORY_WAVE_WIDE").is_some_and(|v| v == "1")
             && let Some(list) = std::env::var_os("VICTORY_WAVE_WIDE_ONLY").filter(|v| !v.is_empty())
         {
+            // Unlisted shaders can now use the driver loop. Refresh only
+            // the caches written under a scoped opt-in.
+            bytes.extend_from_slice(b"wave-wide-only-driver-loop-v1\0");
             bytes.extend_from_slice(b"VICTORY_WAVE_WIDE_ONLY=");
             bytes.extend_from_slice(list.as_encoded_bytes());
             bytes.push(0);

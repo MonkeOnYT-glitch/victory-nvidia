@@ -168,6 +168,12 @@ Then play on the Series S profile, the one every session above uses:
 scripts\play.ps1 -Exe <path of your copy's executable> -Console series-s
 ```
 
+If the shader cache contains fewer than 1,000 stored translations,
+`play.ps1` runs `victory shaders` before launching the title. It scans the
+configured game directory when available, or the executable's directory.
+The driver may still build pipelines during the first run. Use `-SkipShaders`
+to skip the translation step.
+
 `Play-VIctory.cmd` takes the same options from a Command Prompt; on a double-click
 PowerShell asks for the executable's path.
 
@@ -188,6 +194,26 @@ Every `VICTORY_...` switch is described in a comment where the code reads it.
 More commands and debugging switches:
 [docs/README-fxceless.md](docs/README-fxceless.md) and [docs/findings.md](docs/findings.md);
 recording one frame and running it again: [docs/replay.md](docs/replay.md).
+
+### Direct3D 12 on Windows 10
+
+If the Windows runtime rejects root signature flags `c00` or `c01`, build an
+executable that requests the application-local DirectX Agility SDK. Download
+[Microsoft.Direct3D.D3D12 1.620.2](https://www.nuget.org/packages/Microsoft.Direct3D.D3D12/1.620.2),
+open the `.nupkg` as a ZIP and copy `build/native/bin/x64/D3D12Core.dll` into
+`target\diag\D3D12\`. Build from the repository root:
+
+```powershell
+$env:VICTORY_AGILITY_SDK = '1'
+try { cargo build --locked --profile diag -p victory --features diagnostics }
+finally { Remove-Item Env:VICTORY_AGILITY_SDK }
+```
+
+Launch with `scripts\play.ps1` as usual. The `D3D12` folder goes next to the
+executable. Use `target\release\D3D12\` for a release build. Keep the folder
+beside the executable if you move it. For the optional D3D12 debug layer,
+use `D3D12SDKLayers.dll` from the same package. A normal rebuild with
+`VICTORY_AGILITY_SDK` unset uses the Windows runtime.
 
 ## How this tree is built
 
